@@ -1,0 +1,48 @@
+[package]
+name = "gstr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+authors = ["orzogc <orzogc@163.com>"]
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+# For running proptest in MIRI
+proptest_miri = []
+serde = ["dep:serde"]
+rkyv = ["dep:rkyv"]
+std = []
+
+[dependencies]
+rkyv = { version = "0.7", optional = true, default-features = false, features = [
+    "size_32",
+] }
+serde = { version = "1", optional = true, default-features = false, features = [
+    "alloc",
+] }
+
+[dev-dependencies]
+criterion = "0.5.1"
+proptest = { version = "1.5.0", default-features = false, features = ["std"] }
+rkyv = { version = "0.7", default-features = false, features = [
+    "alloc",
+    "size_32",
+] }
+
+[lints.rust]
+#missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_else = "warn"
+ref_as_ptr = "warn"
+semicolon_if_nothing_returned = "warn"
+undocumented_unsafe_blocks = "warn"
+unwrap_or_default = "warn"
