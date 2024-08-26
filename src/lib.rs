@@ -402,21 +402,6 @@ impl GStr {
         }
     }
 
-    #[inline]
-    pub const fn const_try_new(string: &'static str) -> Option<Self> {
-        if string.len() <= Self::MAX_INLINE_LENGTH {
-            Some(InlineBuffer::const_new(string).into_gstr())
-        } else if string.len() <= Self::MAX_LENGTH {
-            Some(Self {
-                len: unsafe { Length::new_static_unchecked(string.len()) },
-                prefix: const_copy_prefix(string.as_bytes()),
-                ptr: string.as_ptr(),
-            })
-        } else {
-            None
-        }
-    }
-
     /// # Panics
     ///
     /// Panics if the length of `s` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
@@ -760,6 +745,27 @@ impl GStr {
     }
 
     #[inline]
+    const fn as_len_prefix_u64(&self) -> u64 {
+        #[cfg(target_pointer_width = "64")]
+        // SAFETY:
+        // - `GStr` is valid for reading its first 8 bytes as `u64`.
+        // - `GStr` is properly initialized.
+        // - `GStr`'s alignment is the same as `u64`.
+        unsafe {
+            ptr::read(ptr::from_ref(self).cast::<u64>())
+        }
+
+        #[cfg(target_pointer_width = "32")]
+        // SAFETY:
+        // - `GStr` is valid for reading its first 8 bytes as `u64`.
+        // - `GStr` is properly initialized.
+        // - `GStr`'s alignment is 4 and `u64`'s alignment is 8, so `ptr::read_unaligned` is used.
+        unsafe {
+            ptr::read_unaligned(ptr::from_ref(self).cast::<u64>())
+        }
+    }
+
+    #[inline]
     pub const fn as_ptr(&self) -> *const u8 {
         if self.is_inline() {
             let buf = unsafe { InlineBuffer::from_gstr(self) };
@@ -776,6 +782,7 @@ impl GStr {
     }
 
     #[inline]
+    #[must_use]
     pub const fn as_str(&self) -> &str {
         unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
     }
@@ -1082,14 +1089,24 @@ where
 impl PartialEq<str> for GStr {
     #[inline]
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        if gstr_str_len_prefix_eq(self, other) {
+            debug_assert_eq!(self.len(), other.len());
+            let len = other.len();
+
+            let a = unsafe { slice::from_raw_parts(self.as_ptr(), len) };
+            let b = unsafe { slice::from_raw_parts(other.as_ptr(), len) };
+
+            a == b
+        } else {
+            false
+        }
     }
 }
 
 impl PartialEq<GStr> for str {
     #[inline]
     fn eq(&self, other: &GStr) -> bool {
-        self == other.as_str()
+        other == self
     }
 }
 
@@ -1141,14 +1158,20 @@ where
 impl PartialOrd<str> for GStr {
     #[inline]
     fn partial_cmp(&self, other: &str) -> Option<Ordering> {
-        self.as_str().partial_cmp(other)
+        match self.prefix.cmp(&str_prefix(other)) {
+            Ordering::Equal => self.as_str().partial_cmp(other),
+            not_eq => Some(not_eq),
+        }
     }
 }
 
 impl PartialOrd<GStr> for str {
     #[inline]
     fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
-        self.partial_cmp(other.as_str())
+        match str_prefix(self).cmp(&other.prefix) {
+            Ordering::Equal => self.partial_cmp(other.as_str()),
+            not_eq => Some(not_eq),
+        }
     }
 }
 
@@ -1547,45 +1570,48 @@ const fn const_copy_prefix(bytes: &[u8]) -> [u8; GStr::PREFIX_LENGTH] {
     prefix
 }
 
+#[cfg(target_endian = "little")]
+/// A mask for [`GStr`]'s `len` and `prefix` to set the static flag 0 (`0xFFFF_FFFF_7FFF_FFFF`).
+const LEN_PREFIX_MASK: u64 = !(Length::STATIC_MASK as u64);
+
+#[cfg(target_endian = "big")]
+/// A mask for [`GStr`]'s `len` and `prefix` to set the static flag 0 (`0x7FFF_FFFF_FFFF_FFFF`).
+const LEN_PREFIX_MASK: u64 = !((Length::STATIC_MASK as u64) << 32);
+
 /// Compares two [`GStr`]'s `len` and `prefix` at the same time.
 #[inline]
 const fn gstr_len_prefix_eq(a: &GStr, b: &GStr) -> bool {
-    #[cfg(target_endian = "little")]
-    /// A mask for [`GStr`]'s `len` and `prefix` to set the static flag 0 (`0xFFFF_FFFF_7FFF_FFFF`).
-    const PREFIX_MASK: u64 = !(Length::STATIC_MASK as u64);
+    (a.as_len_prefix_u64() & LEN_PREFIX_MASK) == (b.as_len_prefix_u64() & LEN_PREFIX_MASK)
+}
 
-    #[cfg(target_endian = "big")]
-    /// A mask for [`GStr`]'s `len` and `prefix` to set the static flag 0 (`0x7FFF_FFFF_FFFF_FFFF`).
-    const PREFIX_MASK: u64 = !((Length::STATIC_MASK as u64) << 32);
+/// Gets the first [`PREFIX_LENGTH`](GStr::PREFIX_LENGTH) bytes of `string`.
+#[inline]
+fn str_prefix(string: &str) -> [u8; GStr::PREFIX_LENGTH] {
+    let mut prefix = [0u8; 4];
 
-    const _: () = {
-        #[cfg(target_endian = "little")]
-        assert!(PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
-        #[cfg(target_endian = "big")]
-        assert!(PREFIX_MASK == 0x7FFF_FFFF_FFFF_FFFF);
-    };
+    unsafe {
+        ptr::copy_nonoverlapping::<u8>(
+            string.as_ptr(),
+            prefix.as_mut_ptr(),
+            string.len().min(GStr::PREFIX_LENGTH),
+        );
+    }
 
-    #[cfg(target_pointer_width = "64")]
-    // SAFETY:
-    // - `GStr` is valid for reading its first 8 bytes as `u64`.
-    // - `GStr` is properly initialized.
-    // - `GStr`'s alignment is the same as `u64`.
-    let a_prefix = unsafe { ptr::read(ptr::from_ref(a).cast::<u64>()) };
-    #[cfg(target_pointer_width = "32")]
-    // SAFETY:
-    // - `GStr` is valid for reading its first 8 bytes as `u64`.
-    // - `GStr` is properly initialized.
-    // - `GStr`'s alignment is 4 and `u64`'s alignment is 8, so `ptr::read_unaligned` is used.
-    let a_prefix = unsafe { ptr::read_unaligned(ptr::from_ref(a).cast::<u64>()) };
+    prefix
+}
 
-    #[cfg(target_pointer_width = "64")]
-    // SAFETY: See above.
-    let b_prefix = unsafe { ptr::read(ptr::from_ref(b).cast::<u64>()) };
-    #[cfg(target_pointer_width = "32")]
-    // SAFETY: See above.
-    let b_prefix = unsafe { ptr::read_unaligned(ptr::from_ref(b).cast::<u64>()) };
+#[inline]
+fn gstr_str_len_prefix_eq(a: &GStr, b: &str) -> bool {
+    let a_prefix = a.as_len_prefix_u64();
 
-    (a_prefix & PREFIX_MASK) == (b_prefix & PREFIX_MASK)
+    let b_prefix_array = [
+        (b.len().min(u32::MAX as _) as u32) ^ Length::LENGTH_MASK,
+        unsafe { mem::transmute::<[u8; GStr::PREFIX_LENGTH], u32>(str_prefix(b)) },
+    ];
+
+    // If `b.len()` is greater than `GStr::MAX_INLINE_LENGTH`, `b_prefix_array[0]` will be 0 or its
+    // most significant bit will be 1, so `false` will be returned.
+    (a_prefix & LEN_PREFIX_MASK) == unsafe { mem::transmute::<[u32; 2], u64>(b_prefix_array) }
 }
 
 /// Shrinks `string`'s capacity to match its length and leaks it as a static mutable [`str`].
@@ -1709,8 +1735,14 @@ const _: () = {
     #[cfg(target_pointer_width = "32")]
     assert!(GStr::MAX_INLINE_LENGTH == 8);
     assert!(GStr::MAX_LENGTH == Length::MAX_LENGTH);
+    assert!(GStr::MAX_LENGTH <= isize::MAX as _);
 
     assert!(InlineBuffer::BUFFER_LENGTH == GStr::MAX_INLINE_LENGTH);
+
+    #[cfg(target_endian = "little")]
+    assert!(LEN_PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
+    #[cfg(target_endian = "big")]
+    assert!(LEN_PREFIX_MASK == 0x7FFF_FFFF_FFFF_FFFF);
 };
 
 #[cfg(target_pointer_width = "16")]
@@ -1781,17 +1813,6 @@ mod tests {
     }
 
     fn test_gstr_const_new(string: &'static str) {
-        let gstr = GStr::const_try_new(string).unwrap();
-
-        assert!(!gstr.is_heap());
-        if string.len() <= GStr::MAX_INLINE_LENGTH {
-            assert!(gstr.is_inline());
-        } else {
-            assert!(gstr.is_static());
-        }
-
-        test_gstr_is_eq(gstr, string);
-
         let gstr = GStr::const_new(string);
 
         assert!(!gstr.is_heap());
@@ -1918,8 +1939,7 @@ mod tests {
             test_gstr_const_new(string);
 
             // To avoid memory leaks.
-            // SAFETY: `GStr` doesn't drop its inner string buffer if it's created from a static
-            //         string.
+            // SAFETY: `GStr` doesn't drop its inner string buffer if it's created by `const_new`.
             unsafe {
                 drop(String::from_raw_parts(ptr, len, capacity));
             }
