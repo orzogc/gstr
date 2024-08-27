@@ -2,6 +2,7 @@
 
 use core::fmt;
 
+extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 
 use serde::{
@@ -44,7 +45,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
     {
         match GStr::try_new(v) {
             Ok(s) => Ok(s),
-            Err(e) => match e.kind {
+            Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
                 ErrorKind::AllocationFailure => crate::handle_alloc_error(e),
                 _ => unsafe { core::hint::unreachable_unchecked() },
@@ -58,7 +59,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
     {
         match GStr::try_from_string(v) {
             Ok(s) => Ok(s),
-            Err(e) => match e.kind {
+            Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
                 ErrorKind::AllocationFailure => crate::handle_alloc_error(e),
                 _ => unsafe { core::hint::unreachable_unchecked() },
@@ -86,7 +87,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
     {
         match GStr::from_utf8(v) {
             Ok(s) => Ok(s),
-            Err(e) => match e.kind {
+            Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
                 ErrorKind::AllocationFailure => crate::handle_alloc_error(e),
                 ErrorKind::Utf8Error(_) => {

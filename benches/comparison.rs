@@ -8,73 +8,153 @@ use rand::{
 
 use gstr::GStr;
 
+fn random_string() -> (Vec<GStr>, Vec<String>) {
+    const STRING_MAX_LENGTH: usize = 256;
+    const STRINGS_COUNT: usize = 64;
+
+    let mut rng = rand::thread_rng();
+
+    let strings: Vec<String> = (0..STRINGS_COUNT)
+        .map(|_| {
+            let len = rng.gen_range(0..=STRING_MAX_LENGTH);
+
+            Alphanumeric.sample_string(&mut rng, len)
+        })
+        .collect();
+    let gstrs = strings.iter().map(GStr::new).collect::<Vec<_>>();
+
+    (gstrs, strings)
+}
+
 fn fixed_string_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("Fixed String Access");
 
-    let words: Vec<String> = vec![0usize, 4, 8, 9, 12, 13, 64, 128]
+    let strings: Vec<String> = vec![0usize, 4, 8, 12, 16, 32, 64, 128]
         .into_iter()
         .map(|len| (0..len).map(|_| 'a').collect())
         .collect();
 
-    for word in words {
-        let gstr = GStr::new(&word);
+    for string in strings {
+        let gstr = GStr::new(&string);
         group.bench_with_input(BenchmarkId::new("GStr", gstr.len()), &gstr, |b, gstr| {
-            b.iter(|| gstr.as_str());
+            b.iter(|| gstr.bytes().next());
         });
 
-        let string = word.clone();
         group.bench_with_input(
             BenchmarkId::new("String", string.len()),
             &string,
-            |b, string| b.iter(|| string.as_str()),
+            |b, string| b.iter(|| string.bytes().next()),
         );
     }
 }
 
 fn random_string_access(c: &mut Criterion) {
-    const WORDS_COUNT: usize = 64;
-
     let mut group = c.benchmark_group("Random String Access");
-    let mut rng = rand::thread_rng();
+    let (gstrs, strings) = random_string();
 
-    let words_vec: Vec<(usize, Vec<String>)> = vec![4usize, 8, 9, 12, 13, 64, 128, 256]
-        .into_iter()
-        .map(|max_len| {
-            let mut vec = Vec::with_capacity(WORDS_COUNT);
-            for _ in 0..WORDS_COUNT {
-                let len = rng.gen_range(0..=max_len);
-                vec.push(Alphanumeric.sample_string(&mut rng, len));
+    group.bench_with_input(BenchmarkId::new("GStr", ""), &gstrs, |b, gstrs| {
+        b.iter(|| {
+            for gstr in gstrs {
+                black_box(gstr.bytes().next());
             }
+        });
+    });
 
-            (max_len, vec)
-        })
-        .collect();
+    group.bench_with_input(BenchmarkId::new("String", ""), &strings, |b, strings| {
+        b.iter(|| {
+            for string in strings {
+                black_box(string.bytes().next());
+            }
+        });
+    });
+}
 
-    for (max_len, vec) in words_vec {
-        let gstrs = vec.iter().map(GStr::new).collect::<Vec<_>>();
-        let strings = vec.iter().map(String::from).collect::<Vec<_>>();
+fn random_string_equality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Random String Equality");
+    let (gstrs, strings) = random_string();
 
-        group.bench_with_input(BenchmarkId::new("GStr", max_len), &gstrs, |b, gstrs| {
+    group.bench_with_input(BenchmarkId::new("GStr", ""), &gstrs, |b, gstrs| {
+        b.iter(|| {
+            for i in 0..gstrs.len() {
+                for j in i..gstrs.len() {
+                    black_box(gstrs[i] == gstrs[j]);
+                }
+            }
+        });
+    });
+
+    group.bench_with_input(BenchmarkId::new("String", ""), &strings, |b, strings| {
+        b.iter(|| {
+            for i in 0..strings.len() {
+                for j in i..strings.len() {
+                    black_box(strings[i] == strings[j]);
+                }
+            }
+        });
+    });
+
+    group.bench_with_input(
+        BenchmarkId::new("Gstr and String", ""),
+        &(gstrs, strings),
+        |b, (gstrs, strings)| {
             b.iter(|| {
-                for s in gstrs {
-                    black_box(s.as_str());
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..gstrs.len() {
+                    for j in i..strings.len() {
+                        black_box(gstrs[i] == strings[j]);
+                    }
                 }
             });
-        });
+        },
+    );
+}
 
-        group.bench_with_input(
-            BenchmarkId::new("String", max_len),
-            &strings,
-            |b, strings| {
-                b.iter(|| {
-                    for s in strings {
-                        black_box(s.as_str());
+fn random_string_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Random String Comparison");
+    let (gstrs, strings) = random_string();
+
+    group.bench_with_input(BenchmarkId::new("GStr", ""), &gstrs, |b, gstrs| {
+        b.iter(|| {
+            for i in 0..gstrs.len() {
+                for j in i..gstrs.len() {
+                    black_box(gstrs[i].cmp(&gstrs[j]));
+                }
+            }
+        });
+    });
+
+    group.bench_with_input(BenchmarkId::new("String", ""), &strings, |b, strings| {
+        b.iter(|| {
+            for i in 0..strings.len() {
+                for j in i..strings.len() {
+                    black_box(strings[i].cmp(&strings[j]));
+                }
+            }
+        });
+    });
+
+    group.bench_with_input(
+        BenchmarkId::new("Gstr and String", ""),
+        &(gstrs, strings),
+        |b, (gstrs, strings)| {
+            b.iter(|| {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..gstrs.len() {
+                    for j in i..strings.len() {
+                        black_box(gstrs[i].partial_cmp(strings[j].as_str()));
                     }
-                });
-            },
-        );
-    }
+                }
+            });
+        },
+    );
 }
 
 criterion_group!(string_access, fixed_string_access, random_string_access);
-criterion_main!(string_access);
+
+criterion_group!(
+    string_comparison,
+    random_string_equality,
+    random_string_comparison
+);
+
+criterion_main!(string_access, string_comparison);
