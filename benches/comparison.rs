@@ -141,7 +141,7 @@ fn random_string_comparison(c: &mut Criterion) {
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..gstrs.len() {
                     for j in i..strings.len() {
-                        black_box(gstrs[i].partial_cmp(strings[j].as_str()));
+                        black_box(gstrs[i].partial_cmp(&strings[j]));
                     }
                 }
             });
@@ -157,4 +157,4 @@ criterion_group!(
     random_string_comparison
 );
 
-criterion_main!(string_access, string_comparison);
+criterion_main!(string_comparison);

@@ -936,7 +936,6 @@ impl Default for GStr {
 impl PartialEq for GStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // TODO: benchmark this
         if gstr_len_prefix_eq(self, other) {
             debug_assert_eq!(self.len(), other.len());
             debug_assert_eq!(self.prefix, other.prefix);
@@ -1019,26 +1018,14 @@ where
 impl PartialEq<str> for GStr {
     #[inline]
     fn eq(&self, other: &str) -> bool {
-        if other.is_empty() {
-            self.is_empty()
-        } else if gstr_str_len_prefix_eq(self, other) {
-            debug_assert_eq!(self.len(), other.len());
-
-            let len = other.len();
-            let a = unsafe { slice::from_raw_parts(self.as_ptr(), len) };
-            let b = unsafe { slice::from_raw_parts(other.as_ptr(), len) };
-
-            a == b
-        } else {
-            false
-        }
+        self.as_str() == other
     }
 }
 
 impl PartialEq<GStr> for str {
     #[inline]
     fn eq(&self, other: &GStr) -> bool {
-        other == self
+        self == other.as_str()
     }
 }
 
@@ -1090,20 +1077,14 @@ where
 impl PartialOrd<str> for GStr {
     #[inline]
     fn partial_cmp(&self, other: &str) -> Option<Ordering> {
-        match self.prefix.cmp(&copy_prefix(other.as_bytes())) {
-            Ordering::Equal => self.as_str().partial_cmp(other),
-            not_eq => Some(not_eq),
-        }
+        self.as_str().partial_cmp(other)
     }
 }
 
 impl PartialOrd<GStr> for str {
     #[inline]
     fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
-        match copy_prefix(self.as_bytes()).cmp(&other.prefix) {
-            Ordering::Equal => self.partial_cmp(other.as_str()),
-            not_eq => Some(not_eq),
-        }
+        self.partial_cmp(other.as_str())
     }
 }
 
@@ -1111,6 +1092,20 @@ impl PartialOrd<GStr> for &'_ str {
     #[inline]
     fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
         (*self).partial_cmp(other)
+    }
+}
+
+impl PartialOrd<String> for GStr {
+    #[inline]
+    fn partial_cmp(&self, other: &String) -> Option<Ordering> {
+        self.partial_cmp(other.as_str())
+    }
+}
+
+impl PartialOrd<GStr> for String {
+    #[inline]
+    fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
+        self.as_str().partial_cmp(other)
     }
 }
 
@@ -1326,7 +1321,8 @@ impl FromIterator<GStr> for Cow<'_, str> {
     }
 }
 
-/// Copies the first [`PREFIX_LENGTH`](GStr::PREFIX_LENGTH) bytes of `bytes` into an array.
+/// Copies the first [`PREFIX_LENGTH`](GStr::PREFIX_LENGTH) bytes of `bytes` into an array in const
+/// context.
 ///
 /// If the length of `bytes` is less than [`PREFIX_LENGTH`](GStr::PREFIX_LENGTH), the remaining
 /// bytes are filled with 0.
@@ -1423,7 +1419,7 @@ const fn gstr_len_prefix_eq(a: &GStr, b: &GStr) -> bool {
     a.as_len_prefix_u64() == b.as_len_prefix_u64()
 }
 
-#[inline]
+/* #[inline]
 fn gstr_str_len_prefix_eq(a: &GStr, b: &str) -> bool {
     let a_prefix = a.as_len_prefix_u64();
 
@@ -1434,7 +1430,7 @@ fn gstr_str_len_prefix_eq(a: &GStr, b: &str) -> bool {
     // If `b.len()` is greater than `GStr::MAX_LENGTH`, the most significant bit in
     // `b_prefix_array[0]` will be 1, so `false` will be returned.
     a_prefix == unsafe { mem::transmute::<[u32; 2], u64>(b_prefix_array) }
-}
+} */
 
 /// Returns an allocation failure error.
 #[cold]
