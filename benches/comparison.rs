@@ -157,4 +157,4 @@ criterion_group!(
     random_string_comparison
 );
 
-criterion_main!(string_comparison);
+criterion_main!(string_access, string_comparison);
