@@ -1,4 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(feature = "nightly_test", feature(str_from_utf16_endian))]
 #![no_std]
 
 #[cfg(target_pointer_width = "16")]

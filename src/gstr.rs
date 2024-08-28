@@ -236,10 +236,21 @@ impl RawBuffer {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
+/// The prefix buffer and length of a [`GStr`].
+///
+/// The most significant 32 bits are used to store the prefix buffer. On little endian machines, the
+/// prefix buffer's order is reversed for comparison optimization.
+///
+/// The least significant 31 bits are used to store the length of the string buffer.
+///
+/// The remained one bit is the static flag. If the static flag is 1, then the string buffer is
+/// static.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 struct PrefixAndLength(u64);
 
+#[cfg(target_pointer_width = "64")]
 impl PrefixAndLength {
     /// The length of the prefix buffer (`4`).
     const PREFIX_LENGTH: usize = size_of::<u32>();
@@ -264,9 +275,7 @@ impl PrefixAndLength {
 
     /// A mask for [`PrefixAndLength`] to set the static flag as 0 (`0xFFFF_FFFF_7FFF_FFFF`).
     const LEN_PREFIX_MASK: u64 = !Self::STATIC_MASK;
-}
 
-impl PrefixAndLength {
     /// Creates a new [`PrefixAndLength`] for non-static strings.
     ///
     /// # Safety
@@ -277,12 +286,14 @@ impl PrefixAndLength {
     const unsafe fn new_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
         debug_assert!(len <= Self::MAX_LENGTH);
 
+        // Reversed the order of the prefix buffer on little endian machines to optimize comparison.
         #[cfg(target_endian = "little")]
         let array = [len as u32, u32::from_be_bytes(prefix)];
 
         #[cfg(target_endian = "big")]
         let array = [u32::from_be_bytes(prefix), len as u32];
 
+        // SAFETY: `[u32; 2]` is safe to be represented as `u64`.
         unsafe { Self(mem::transmute::<[u32; 2], u64>(array)) }
     }
 
@@ -294,11 +305,13 @@ impl PrefixAndLength {
     /// - The returned [`Length`] is for static strings.
     #[inline]
     const unsafe fn new_static_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
+        // SAFETY: `len` is guaranteed to not be greate than `MAX_LENGTH`.
         let prefix_and_len = unsafe { Self::new_unchecked(prefix, len) };
 
         Self(prefix_and_len.0 | Self::STATIC_MASK)
     }
 
+    /// Returns the prefix buffer.
     #[inline]
     const fn as_prefix(self) -> [u8; Self::PREFIX_LENGTH] {
         ((self.0 >> Self::HALF_BITS) as u32).to_be_bytes()
@@ -310,6 +323,8 @@ impl PrefixAndLength {
         (self.0 & Self::LENGTH_MASK) as _
     }
 
+    /// Returns the prefix buffer (its order is reversed on little endian machines) and the actual
+    /// length as a [`u64`].
     #[inline]
     const fn as_prefix_len_u64(self) -> u64 {
         self.0 & Self::LEN_PREFIX_MASK
@@ -327,16 +342,125 @@ impl PrefixAndLength {
         (self.0 as u32) <= Self::LENGTH_MASK as u32
     }
 
+    /// Compares the prefix buffers of two [`PrefixAndLength`]s.
     #[inline]
-    fn cmp_prefix(self, other: Self) -> Ordering {
+    fn prefix_cmp(self, other: Self) -> Ordering {
         (self.0 & Self::PREFIX_MASK).cmp(&(other.0 & Self::PREFIX_MASK))
     }
 }
 
+#[cfg(target_pointer_width = "32")]
+/// The prefix buffer and length of a [`GStr`].
+///
+/// On little endian machines, the prefix buffer's order is reversed for comparison optimization.
+///
+/// The most significant bit in `len` is the static flag. If the static flag is 1, then the string
+/// buffer is static.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct PrefixAndLength {
+    #[cfg(target_endian = "little")]
+    /// The length of the string buffer.
+    len: u32,
+    /// The prefix buffer.
+    prefix: [u8; Self::PREFIX_LENGTH],
+    #[cfg(target_endian = "big")]
+    /// The length of the string buffer.
+    len: u32,
+}
+
+#[cfg(target_pointer_width = "32")]
+impl PrefixAndLength {
+    /// The length of the prefix buffer (`4`).
+    const PREFIX_LENGTH: usize = size_of::<u32>();
+
+    /// The number of bits used to represent the length (`31`).
+    const LENGTH_BITS: u8 = u32::BITS as u8 - 1;
+
+    /// A mask intended to set the static flag (`0x8000_0000`).
+    const STATIC_MASK: u32 = 1 << Self::LENGTH_BITS;
+
+    /// A mask that isolates the length part of the value (`0x7FFF_FFFF`).
+    const LENGTH_MASK: u32 = Self::STATIC_MASK - 1;
+
+    /// The maximum length (`0x7FFF_FFFF`).
+    const MAX_LENGTH: usize = Self::LENGTH_MASK as _;
+
+    /// Creates a new [`PrefixAndLength`] for non-static strings.
+    ///
+    /// # Safety
+    ///
+    /// - `len` must not be greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - The returned [`PrefixAndLength`] is for non-static strings.
+    #[inline]
+    const unsafe fn new_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
+        debug_assert!(len <= Self::MAX_LENGTH);
+
+        Self {
+            len: len as _,
+            prefix: u32::from_be_bytes(prefix).to_ne_bytes(),
+        }
+    }
+
+    /// Creates a new [`Length`] for static strings.
+    ///
+    /// # Safety
+    ///
+    /// - `len` must not be greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - The returned [`Length`] is for static strings.
+    #[inline]
+    const unsafe fn new_static_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
+        debug_assert!(len <= Self::MAX_LENGTH);
+
+        Self {
+            len: len as u32 | Self::STATIC_MASK,
+            prefix: u32::from_be_bytes(prefix).to_ne_bytes(),
+        }
+    }
+
+    /// Returns the prefix buffer.
+    #[inline]
+    const fn as_prefix(self) -> [u8; Self::PREFIX_LENGTH] {
+        u32::from_ne_bytes(self.prefix).to_be_bytes()
+    }
+
+    /// Returns the actual length.
+    #[inline]
+    const fn as_len(self) -> usize {
+        (self.len & Self::LENGTH_MASK) as _
+    }
+
+    /// Indicates whether the string buffer is static.
+    #[inline]
+    const fn is_static(self) -> bool {
+        !self.is_heap()
+    }
+
+    /// Indicates whether the string buffer is heap allocated.
+    #[inline]
+    const fn is_heap(self) -> bool {
+        self.len <= Self::LENGTH_MASK
+    }
+
+    /// Returns whether the prefix buffers of two [`PrefixAndLength`]s is equal.
+    #[inline]
+    const fn prefix_eq(self, other: Self) -> bool {
+        u32::from_ne_bytes(self.prefix) == u32::from_ne_bytes(other.prefix)
+    }
+
+    /// Compares the prefix buffers of two [`PrefixAndLength`]s.
+    #[inline]
+    fn prefix_cmp(self, other: Self) -> Ordering {
+        u32::from_ne_bytes(self.prefix).cmp(&u32::from_ne_bytes(other.prefix))
+    }
+}
+
 /// An immutable string optimized for small strings and comparison.
+// NOTE: If the string buffer is heap allocated, it can't be empty.
 pub struct GStr {
     /// The pointer which points to the string buffer.
     ptr: NonNull<u8>,
+    /// The prefix buffer and the length of the string buffer.
     prefix_and_len: PrefixAndLength,
 }
 
@@ -354,12 +478,18 @@ impl GStr {
     ///
     /// The string is cloned if it isn't empty.
     ///
+    /// # Errors
+    ///
+    /// Returns a [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH) or
+    /// allocation failure occurs.
+    ///
     /// # Example
     ///
     /// ```
-    /// # use gstr::GStr;
-    /// let string = GStr::try_new("Hello, world!").unwrap();
-    /// assert_eq!(string, "Hello, world!");
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::try_new("Hello, World!").unwrap();
+    /// assert_eq!(string, "Hello, World!");
     /// ```
     pub fn try_new<S: AsRef<str>>(string: S) -> Result<Self, ToGStrError<S>> {
         let s = string.as_ref();
@@ -408,9 +538,11 @@ impl GStr {
     /// # Example
     ///
     /// ```
-    /// # use gstr::GStr;
-    /// let string = GStr::new("Hello, world!");
-    /// assert_eq!(string, "Hello, world!");
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// assert_eq!(string, "Hello, World!");
+    /// ```
     #[must_use]
     pub fn new<S: AsRef<str>>(string: S) -> Self {
         match Self::try_new(string) {
@@ -436,9 +568,11 @@ impl GStr {
     /// # Example
     ///
     /// ```
-    /// # use gstr::GStr;
-    /// let string = const { GStr::from_static("Hello, world!")};
-    /// assert_eq!(string, "Hello, world!");
+    /// use gstr::GStr;
+    ///
+    /// let string = const { GStr::from_static("Hello, World!")};
+    /// assert_eq!(string, "Hello, World!");
+    /// ```
     #[inline]
     #[must_use]
     pub const fn from_static(string: &'static str) -> Self {
@@ -461,14 +595,25 @@ impl GStr {
 
     /// Creates a [`GStr`] from a [`String`].
     ///
-    /// This doesn't clone the string but shrinks it's capacity to match its length.
+    /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
+    /// capacity is equal to its length, no reallocation occurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH) or
+    /// shrinking the string's capacity fails.
     ///
     /// # Example
     ///
     /// ```
-    /// # use gstr::GStr;
-    /// let string = GStr::try_from_string(String::from("Hello, world!")).unwrap();
-    /// assert_eq!(string, "Hello, world!");
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::try_from_string(string).unwrap();
+    /// assert_eq!(gstr, "Hello, World!");
+    /// assert_eq!(string_ptr, gstr.as_ptr());
+    /// ```
     #[inline]
     pub fn try_from_string(string: String) -> Result<Self, ToGStrError<String>> {
         let len = string.len();
@@ -479,6 +624,9 @@ impl GStr {
             // SAFETY: `string` isn't empty.
             match unsafe { shrink_and_leak_string(string) } {
                 Ok(s) => {
+                    // SAFETY: The length of `s` returned from `shrink_and_leak_string` is equal to
+                    //         the length of `string`. This assertion is used to avoid some extra
+                    //         branches.
                     unsafe {
                         core::hint::assert_unchecked(s.len() == len);
                     }
@@ -501,7 +649,8 @@ impl GStr {
 
     /// Creates a [`GStr`] from a [`String`].
     ///
-    /// This doesn't clone the string but shrinks it's capacity to match its length.
+    /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
+    /// capacity is equal to its length, no reallocation occurs.
     ///
     /// # Panics
     ///
@@ -511,9 +660,14 @@ impl GStr {
     /// # Example
     ///
     /// ```
-    /// # use gstr::GStr;
-    /// let string = GStr::from_string(String::from("Hello, world!"));
-    /// assert_eq!(string, "Hello, world!");
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::from_string(string);
+    /// assert_eq!(gstr, "Hello, World!");
+    /// assert_eq!(string_ptr, gstr.as_ptr());
+    /// ```
     #[inline]
     #[must_use]
     pub fn from_string(string: String) -> Self {
@@ -528,31 +682,66 @@ impl GStr {
         }
     }
 
+    /// Creates a [`GStr`] from a raw buffer and its length.
+    ///
+    /// If the raw buffer is static, when the returned [`GStr`] is dropped, the buffer's memory
+    /// won't be deallocated.
+    ///
+    /// # Safety
+    ///
+    /// - If the raw buffer is heap allocated, its memory needs to have been previously allocated
+    ///   by the global allocator, with a non-zero size of exactly `len` and an alignment of exactly
+    ///   one.
+    /// - If the raw buffer is static, its first `len` bytes must be valid.
+    /// - `len` must be less than or equal to [`MAX_LENGTH`](Self::MAX_LENGTH). If the raw buffer
+    ///   is heap allocated, `len` must be greater than zero.
+    /// - The first `len` bytes at `buf` must be valid UTF-8.
+    /// - The ownership of `buf` is effectively transferred to the return [`GStr`]. Ensure that
+    ///   nothing else uses the buffer pointer after calling this function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// let (buf, len) = string.into_raw_parts();
+    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
+    /// assert_eq!(string, "Hello, World!");
+    ///
+    /// let string = GStr::from_static("Hello, Rust!");
+    /// let (buf, len) = string.into_raw_parts();
+    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
+    /// assert_eq!(string, "Hello, Rust!");
+    /// ```
     #[inline]
     #[must_use]
     pub const unsafe fn from_raw_parts(buf: RawBuffer, len: usize) -> Self {
         debug_assert!(len <= Self::MAX_LENGTH);
 
-        match buf {
-            RawBuffer::Static(ptr) => {
-                let bytes = unsafe { slice::from_raw_parts(ptr.as_ptr(), len) };
+        // SAFETY:
+        // - `buf.as_ptr()` is valid for reads for `len` bytes and it's properly aligned for `u8`.
+        // - `buf.as_ptr()` points to a valid UTF-8 string whose length in bytes is `len`.
+        let bytes = unsafe { slice::from_raw_parts(buf.as_ptr(), len) };
 
-                Self {
-                    ptr,
-                    prefix_and_len: unsafe {
-                        PrefixAndLength::new_static_unchecked(copy_prefix(bytes), len)
-                    },
-                }
-            }
+        match buf {
+            RawBuffer::Static(ptr) => Self {
+                ptr,
+                // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
+                prefix_and_len: unsafe {
+                    PrefixAndLength::new_static_unchecked(copy_prefix(bytes), len)
+                },
+            },
             RawBuffer::Heap(ptr) => {
+                // SAFETY: The raw buffer is heap allocated, so `len` is greater than 0. This
+                //         assertion can remove a branch in `copy_prefix`.
                 unsafe {
                     core::hint::assert_unchecked(len > 0);
                 }
 
-                let bytes = unsafe { slice::from_raw_parts(ptr.as_ptr(), len) };
-
                 Self {
                     ptr,
+                    // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
                     prefix_and_len: unsafe {
                         PrefixAndLength::new_unchecked(copy_prefix(bytes), len)
                     },
@@ -561,6 +750,26 @@ impl GStr {
         }
     }
 
+    /// Converts a vector of bytes to a [`GStr`].
+    ///
+    /// # Errors
+    ///
+    /// - Returns a [`Err`] if the slice is not a valid UTF-8 sequence.
+    /// - Returns a [`Err`] if the slice's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
+    ///   or shrinking the vector's capacity fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let sparkle_heart = vec![240, 159, 146, 150];
+    /// let string = GStr::from_utf8(sparkle_heart).unwrap();
+    /// assert_eq!(string, "💖");
+    ///
+    /// let invalid = vec![0, 159, 146, 150];
+    /// assert!(GStr::from_utf8(invalid).is_err());
+    /// ```
     #[inline]
     pub fn from_utf8(bytes: Vec<u8>) -> Result<Self, ToGStrError<Vec<u8>>> {
         let len = bytes.len();
@@ -574,24 +783,57 @@ impl GStr {
         }
     }
 
+    /// Converts a vector of bytes to a [`GStr`] without checking that the slice is a valid UTF-8
+    /// sequence.
+    ///
     /// # Safety
     ///
-    /// `bytes` must be a valid sequence.
+    /// `bytes` must be a valid UTF-8 sequence.
     ///
     /// # Panics
     ///
     /// - Panics if the length of `bytes` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to shrink `bytes`' capacity.
+    /// - Panics if fails to shrink the capacity of `bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let sparkle_heart = vec![240, 159, 146, 150];
+    /// let string = unsafe { GStr::from_utf8_unchecked(sparkle_heart) };
+    /// assert_eq!(string, "💖");
+    /// ```
     #[inline]
     pub unsafe fn from_utf8_unchecked(bytes: Vec<u8>) -> Self {
+        // SAFETY: `bytes` is guranteed to be a valid UTF-8 sequence.
         unsafe { Self::from_string(String::from_utf8_unchecked(bytes)) }
     }
 
+    /// Converts a slice of bytes to a [`GStr`], including invalid characters.
+    ///
+    /// This function will replace any invalid UTF-8 sequences with
+    /// [`U+FFFD REPLACEMENT CHARACTER`](core::char::REPLACEMENT_CHARACTER) , which looks like �.
+    ///
     /// # Panics
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted is greater than
     ///   [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
+    /// - Panics if fails to allocate memory or shrink the capacity of `bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let sparkle_heart = vec![240, 159, 146, 150];
+    /// let string = GStr::from_utf8_lossy(sparkle_heart);
+    /// assert_eq!(string, "💖");
+    ///
+    /// let input = Vec::from(b"Hello \xF0\x90\x80World");
+    /// let output = GStr::from_utf8_lossy(input);
+    /// assert_eq!(output, "Hello �World");
+    /// ```
     #[must_use]
     pub fn from_utf8_lossy(bytes: Vec<u8>) -> Self {
         let mut iter = bytes.utf8_chunks();
@@ -602,6 +844,8 @@ impl GStr {
             if chunk.invalid().is_empty() {
                 debug_assert_eq!(valid.len(), bytes.len());
 
+                // SAFETY: The invalid UTF-8 sequence is empty, so `bytes` is a valid UTF-8
+                //         sequence.
                 return unsafe { Self::from_utf8_unchecked(bytes) };
             }
 
@@ -624,9 +868,29 @@ impl GStr {
         Self::from_string(res)
     }
 
+    /// Decode a UTF-16–encoded slice into a [`GStr`].
+    ///
+    /// # Errors
+    ///
+    /// - Returns a [`Err`] if the slice contains any invalid UTF-16 sequences.
+    /// - Returns a [`Err`] if length in bytes of the UTF-8 sequence converted is greater than
+    ///   [`MAX_LENGTH`](Self::MAX_LENGTH) or shrinking the intermediate string's capacity fails.
+    ///
     /// # Panics
     ///
     /// Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0x0069, 0x0063];
+    /// assert_eq!(GStr::from_utf16(v).unwrap(), "𝄞music");
+    ///
+    /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075,0xD800, 0x0069, 0x0063];
+    /// assert!(GStr::from_utf16(v).is_err())
+    /// ```
     pub fn from_utf16<B: AsRef<[u16]>>(bytes: B) -> Result<Self, ToGStrError<B>> {
         let b = bytes.as_ref();
 
@@ -636,18 +900,55 @@ impl GStr {
         }
     }
 
+    /// Decode a UTF-16–encoded slice into a [`GStr`], replacing invalid data with
+    /// [`U+FFFD REPLACEMENT CHARACTER`](core::char::REPLACEMENT_CHARACTER) , which looks like �.
+    ///
     /// # Panics
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
     /// - Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0x0069, 0x0063];
+    /// assert_eq!(GStr::from_utf16_lossy(v), "𝄞music");
+    ///
+    /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834];
+    /// assert_eq!(GStr::from_utf16_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
+    /// ```
     pub fn from_utf16_lossy<B: AsRef<[u16]>>(bytes: B) -> Self {
         Self::from_string(String::from_utf16_lossy(bytes.as_ref()))
     }
 
+    /// Decode a UTF-16-little-endian–encoded slice into a [`GStr`]
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Err`] if the slice contains any invalid data.
+    ///
     /// # Panics
     ///
-    /// Panics if fails to allocate memory.
+    /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
+    ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x73, 0x00, 0x69, 0x00, 0x63, 0x00];
+    /// assert_eq!(GStr::from_utf16le(v).unwrap(), "𝄞music");
+    ///
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x00, 0xD8, 0x69, 0x00, 0x63, 0x00];
+    /// assert!(GStr::from_utf16le(v).is_err())
+    /// ```
     pub fn from_utf16le<B: AsRef<[u8]>>(bytes: B) -> Result<Self, ToGStrError<B>> {
         let b = bytes.as_ref();
 
@@ -655,6 +956,7 @@ impl GStr {
             return Err(ToGStrError::new_from_utf16_odd_length(bytes));
         }
 
+        // SAFETY: Two `u8`s can be transmuted to a `u16`.
         match (cfg!(target_endian = "little"), unsafe {
             b.align_to::<u16>()
         }) {
@@ -666,6 +968,7 @@ impl GStr {
                 }),
             },
             _ => {
+                // SAFETY: a byte slice whose length is 2 can be converted to a `[u8; 2]`;
                 let iter = b.chunks_exact(2).map(|s| unsafe {
                     u16::from_le_bytes(<[u8; 2]>::try_from(s).unwrap_unchecked())
                 });
@@ -677,14 +980,33 @@ impl GStr {
         }
     }
 
+    /// Decode a UTF-16-little-endian–encoded slice into a [`GStr`], replacing invalid data with
+    /// [`U+FFFD REPLACEMENT CHARACTER`](core::char::REPLACEMENT_CHARACTER) , which looks like �.
+    ///
     /// # Panics
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
     /// - Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x73, 0x00, 0x69, 0x00, 0x63, 0x00];
+    /// assert_eq!(GStr::from_utf16le_lossy(v), "𝄞music");
+    ///
+    /// let v = &[0x34, 0xD8, 0x1E, 0xDD, 0x6d, 0x00, 0x75, 0x00,
+    ///           0x73, 0x00, 0x1E, 0xDD, 0x69, 0x00, 0x63, 0x00,
+    ///           0x34, 0xD8];
+    /// assert_eq!(GStr::from_utf16le_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
+    /// ```
     pub fn from_utf16le_lossy<B: AsRef<[u8]>>(bytes: B) -> Self {
         let b = bytes.as_ref();
 
+        // SAFETY: Two `u8`s can be transmuted to a `u16`.
         match (cfg!(target_endian = "little"), unsafe {
             b.align_to::<u16>()
         }) {
@@ -694,6 +1016,7 @@ impl GStr {
             }
             _ => {
                 let mut iter = b.chunks_exact(2);
+                // SAFETY: a byte slice whose length is 2 can be converted to a `[u8; 2]`;
                 let u16_iter = iter.by_ref().map(|s| unsafe {
                     u16::from_le_bytes(<[u8; 2]>::try_from(s).unwrap_unchecked())
                 });
@@ -710,9 +1033,31 @@ impl GStr {
         }
     }
 
+    /// Decode a UTF-16-big-endian–encoded slice into a [`GStr`]
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Err`] if the slice contains any invalid data.
+    ///
     /// # Panics
     ///
-    /// Panics if fails to allocate memory.
+    /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
+    ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0x00, 0x73, 0x00, 0x69, 0x00, 0x63];
+    /// assert_eq!(GStr::from_utf16be(v).unwrap(), "𝄞music");
+    ///
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0xD8, 0x00, 0x00, 0x69, 0x00, 0x63];
+    /// assert!(GStr::from_utf16be(v).is_err())
+    /// ```
     pub fn from_utf16be<B: AsRef<[u8]>>(bytes: B) -> Result<Self, ToGStrError<B>> {
         let b = bytes.as_ref();
 
@@ -720,6 +1065,7 @@ impl GStr {
             return Err(ToGStrError::new_from_utf16_odd_length(bytes));
         }
 
+        // SAFETY: Two `u8`s can be transmuted to a `u16`.
         match (cfg!(target_endian = "big"), unsafe { b.align_to::<u16>() }) {
             (true, ([], v, [])) => match Self::from_utf16(v) {
                 Ok(s) => Ok(s),
@@ -729,6 +1075,7 @@ impl GStr {
                 }),
             },
             _ => {
+                // SAFETY: a byte slice whose length is 2 can be converted to a `[u8; 2]`;
                 let iter = b.chunks_exact(2).map(|s| unsafe {
                     u16::from_be_bytes(<[u8; 2]>::try_from(s).unwrap_unchecked())
                 });
@@ -740,14 +1087,33 @@ impl GStr {
         }
     }
 
+    /// Decode a UTF-16-little-endian–encoded slice into a [`GStr`], replacing invalid data with
+    /// [`U+FFFD REPLACEMENT CHARACTER`](core::char::REPLACEMENT_CHARACTER) , which looks like �.
+    ///
     /// # Panics
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
     /// - Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0x00, 0x73, 0x00, 0x69, 0x00, 0x63];
+    /// assert_eq!(GStr::from_utf16be_lossy(v), "𝄞music");
+    ///
+    /// let v = &[0xD8, 0x34, 0xDD, 0x1E, 0x00, 0x6d, 0x00, 0x75,
+    ///           0x00, 0x73, 0xDD, 0x1E, 0x00, 0x69, 0x00, 0x63,
+    ///           0xD8, 0x34];
+    /// assert_eq!(GStr::from_utf16be_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
+    /// ```
     pub fn from_utf16be_lossy<B: AsRef<[u8]>>(bytes: B) -> Self {
         let b = bytes.as_ref();
 
+        // SAFETY: Two `u8`s can be transmuted to a `u16`.
         match (cfg!(target_endian = "big"), unsafe { b.align_to::<u16>() }) {
             (true, ([], v, [])) => Self::from_utf16_lossy(v),
             (true, ([], v, [_])) => {
@@ -755,6 +1121,7 @@ impl GStr {
             }
             _ => {
                 let mut iter = b.chunks_exact(2);
+                // SAFETY: a byte slice whose length is 2 can be converted to a `[u8; 2]`;
                 let u16_iter = iter.by_ref().map(|s| unsafe {
                     u16::from_be_bytes(<[u8; 2]>::try_from(s).unwrap_unchecked())
                 });
@@ -771,6 +1138,7 @@ impl GStr {
         }
     }
 
+    /// Returns the prefix buffer of this [`GStr`].
     #[inline]
     const fn prefix(&self) -> [u8; PrefixAndLength::PREFIX_LENGTH] {
         self.prefix_and_len.as_prefix()
@@ -781,7 +1149,8 @@ impl GStr {
     /// # Examples
     ///
     /// ```
-    /// # use gstr::GStr;
+    /// use gstr::GStr;
+    ///
     /// let string = GStr::new("foo");
     /// assert_eq!(string.len(), 3);
     ///
@@ -800,7 +1169,8 @@ impl GStr {
     /// # Examples
     ///
     /// ```
-    /// # use gstr::GStr;
+    /// use gstr::GStr;
+    ///
     /// assert!(GStr::new("").is_empty());
     /// assert!(!GStr::new("foo").is_empty());
     /// ```
@@ -810,50 +1180,136 @@ impl GStr {
         self.len() == 0
     }
 
+    /// Returns whether the string buffer of this [`GStr`] is static.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// assert!(GStr::from_static("Hello, World!").is_static());
+    /// assert!(GStr::new("").is_static());
+    /// assert!(GStr::from_string(String::new()).is_static());
+    /// assert!(!GStr::new("Hello, World!").is_static());
+    /// assert!(!GStr::from_string(String::from("Hello, World!")).is_static());
+    /// ```
     #[inline]
     #[must_use]
     pub const fn is_static(&self) -> bool {
         self.prefix_and_len.is_static()
     }
 
+    /// Returns whether the string buffer of this [`GStr`] is heap-allocated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// assert!(GStr::new("Hello, World!").is_heap());
+    /// assert!(GStr::from_string(String::from("Hello, World!")).is_heap());
+    /// assert!(!GStr::new("").is_heap());
+    /// assert!(!GStr::from_string(String::new()).is_heap());
+    /// assert!(!GStr::from_static("Hello, World!").is_heap());
+    /// ```
     #[inline]
     #[must_use]
     pub const fn is_heap(&self) -> bool {
         self.prefix_and_len.is_heap()
     }
 
+    #[cfg(target_pointer_width = "64")]
+    /// Returns the prefix buffer (its order is reversed on little endian machines) and the actual
+    /// length as a [`u64`].
     #[inline]
     const fn as_prefix_len_u64(&self) -> u64 {
         self.prefix_and_len.as_prefix_len_u64()
     }
 
+    /// Returns a raw pointer of the string buffer. If the string buffer isn't empty, the raw
+    /// pointer points to the first byte of the string buffer.
+    ///
+    /// The returned raw pointer is never null.
+    ///
+    /// The caller must ensure that the returned pointer is never written to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// assert!(!string.as_ptr().is_null());
+    /// ```
     #[inline]
     #[must_use]
     pub const fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
+    /// Return a mutable raw pointer of the string buffer.
     #[inline]
-    const fn as_mut_ptr(&self) -> *mut u8 {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
     }
 
+    /// Returns a byte slice of this [`GStr`]'s contents.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("hello");
+    /// assert_eq!(string.as_bytes(), &[104, 101, 108, 108, 111]);
+    /// ```
     #[inline]
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8] {
+        // SAFETY:
+        // - `self.as_ptr()` is valid for reads of `self.len()` bytes and is properly aligned as
+        //   `u8`.
+        // - The first `self.len()` bytes of the slice are all properly initialized.
         unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
 
+    /// Returns a string slice of this [`GStr`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// assert_eq!(string.as_str(), "Hello, World!");
+    /// ```
     #[inline]
     #[must_use]
     pub const fn as_str(&self) -> &str {
+        // SAFETY: The byte slice of a `GStr` is always a valid UTF-8 sequence.
         unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
+    /// Returns a static string slice of this [`GStr`], if it is static.
+    ///
+    /// Returns `None` if the string buffer is heap-allocated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::from_static("Hello, World!");
+    /// assert_eq!(string.as_static_str(), Some("Hello, World!"));
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// assert_eq!(string.as_static_str(), None);
+    /// ```
     #[inline]
     #[must_use]
     pub const fn as_static_str(&self) -> Option<&'static str> {
         if self.is_static() {
+            // SAFETY: The byte slice of a `GStr` is always a valid UTF-8 sequence.
             unsafe {
                 Some(core::str::from_utf8_unchecked(slice::from_raw_parts(
                     self.as_ptr(),
@@ -865,19 +1321,53 @@ impl GStr {
         }
     }
 
+    /// Converts this [`GStr`] into a [`String`].
+    ///
+    /// If the string buffer is heap-allocated, no allocation is performed. Otherwise the string
+    /// buffer is cloned into a new [`String`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Err`] containing this [`GStr`] if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::from_string(string);
+    /// let string = gstr.try_into_string().unwrap();
+    /// assert_eq!(string, "Hello, World!");
+    /// assert_eq!(string_ptr, string.as_ptr());
+    ///
+    /// let string = GStr::from_static("Hello, Rust!").try_into_string().unwrap();
+    /// assert_eq!(string, "Hello, Rust!");
+    ///
+    /// let empty_string = GStr::EMPTY.try_into_string().unwrap();
+    /// assert_eq!(empty_string, "");
+    /// ```
     #[inline]
     pub fn try_into_string(self) -> Result<String, Self> {
-        let string = ManuallyDrop::new(self);
+        let mut string = ManuallyDrop::new(self);
         let len = string.len();
 
         if string.is_heap() {
             debug_assert!(len > 0);
 
+            // SAFETY:
+            // - The memory pointed by `string.as_mut_ptr()` was allocated by the global allocator
+            //   with a alignment of `u8`. And the size of this memory is `len`.
+            // - The whole memory is a valid UTF-8 sequence.
+            // - The ownership of the memory is transferred to the returned `String`.
             unsafe { Ok(String::from_raw_parts(string.as_mut_ptr(), len, len)) }
-        } else {
+        } else if len > 0 {
+            // SAFETY: The layout of the string buffer is valid and its size is greater than 0.
             let ptr = unsafe { alloc::alloc::alloc(Layout::array::<u8>(len).unwrap_unchecked()) };
 
             if ptr.is_null() {
+                /// Returns the original [`GStr`].
                 #[cold]
                 #[inline(never)]
                 fn return_gstr(string: ManuallyDrop<GStr>) -> Result<String, GStr> {
@@ -886,18 +1376,47 @@ impl GStr {
 
                 return_gstr(string)
             } else {
+                // SAFETY: It's valid to copy `len` bytes from `string.as_ptr()` to `ptr`.
                 unsafe {
                     ptr::copy_nonoverlapping::<u8>(string.as_ptr(), ptr, len);
                 }
 
+                // SAFETY:
+                // - `ptr` points to a memory which is allocated by the global allocator. And the
+                //   size of this memory is `len`.
+                // - The whole memory is a valid UTF-8 sequence.
+                // - The ownership of the memory is transferred to the returned `String`.
                 unsafe { Ok(String::from_raw_parts(ptr, len, len)) }
             }
+        } else {
+            Ok(String::new())
         }
     }
 
+    /// Converts this [`GStr`] into a [`String`].
+    ///
+    /// If the string buffer is heap-allocated, no allocation is performed. Otherwise the string
+    /// buffer is cloned into a new [`String`].
+    ///
     /// # Panics
     ///
     /// Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::from_string(string);
+    /// let string = gstr.into_string();
+    /// assert_eq!(string, "Hello, World!");
+    /// assert_eq!(string_ptr, string.as_ptr());
+    ///
+    /// let string = GStr::from_static("Hello, Rust!").into_string();
+    /// assert_eq!(string, "Hello, Rust!");
+    /// ```
     #[inline]
     #[must_use]
     pub fn into_string(self) -> String {
@@ -907,24 +1426,88 @@ impl GStr {
         }
     }
 
+    /// Converts this [`GStr`] into a <code>[Box]<[str]></code>.
+    ///
+    /// If the string buffer is heap-allocated, no allocation is performed. Otherwise the string
+    /// buffer is cloned into a new <code>[Box]<[str]></code>.
+    ///
     /// # Panics
     ///
     /// Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::from_string(string);
+    /// let boxed_str = gstr.into_boxed_str();
+    /// assert_eq!(boxed_str.as_ref(), "Hello, World!");
+    /// assert_eq!(string_ptr, boxed_str.as_ptr());
+    ///
+    /// let boxed_str = GStr::from_static("Hello, Rust!").into_boxed_str();
+    /// assert_eq!(boxed_str.as_ref(), "Hello, Rust!");
+    /// ```
     #[inline]
     #[must_use]
     pub fn into_boxed_str(self) -> Box<str> {
         self.into_string().into_boxed_str()
     }
 
+    /// Converts this [`GStr`] into a byte vector.
+    ///
+    /// If the string buffer is heap-allocated, no allocation is performed. Otherwise the string
+    /// buffer is cloned into a new byte vector.
+    ///
     /// # Panics
     ///
     /// Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::from_string(string);
+    /// let bytes = gstr.into_bytes();
+    /// assert_eq!(bytes, b"Hello, World!");
+    /// assert_eq!(string_ptr, bytes.as_ptr());
+    ///
+    /// let bytes = GStr::from_static("Hello, Rust!").into_bytes();
+    /// assert_eq!(bytes, b"Hello, Rust!");
+    /// ```
     #[inline]
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.into_string().into_bytes()
     }
 
+    /// Decomposes the [`GStr`] into its raw buffer and length.
+    ///
+    /// After calling this function, the caller is responsible for the memory previously managed
+    /// by the [`GStr`]. The only way to do this is to convert the raw buffer and the length back
+    /// into a [`GStr`] with the [`from_raw_parts`](GStr::from_raw_parts) function, allowing the
+    /// destructor to perform the cleanup.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// let (buf, len) = string.into_raw_parts();
+    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
+    /// assert_eq!(string, "Hello, World!");
+    ///
+    /// let string = GStr::from_static("Hello, Rust!");
+    /// let (buf, len) = string.into_raw_parts();
+    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
+    /// assert_eq!(string, "Hello, Rust!");
+    /// ```
     #[inline]
     #[must_use]
     pub const fn into_raw_parts(self) -> (RawBuffer, usize) {
@@ -942,6 +1525,32 @@ impl GStr {
         (buf, len)
     }
 
+    /* /// Consumes and leaks the [`GStr`], returning a string slice of its contents.
+    ///
+    /// The caller has free choice over the returned lifetime, including `'static`. Dropping the
+    /// returned string slice will cause a memory leak if the string buffer is heap-allocated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::from_static("Hello, World!");
+    /// let static_ref: &'static str = string.leak();
+    /// assert_eq!(static_ref, "Hello, World!");
+    ///
+    /// let string = GStr::new("Hello, Rust!");
+    /// let static_ref = string.leak();
+    /// assert_eq!(static_ref, "Hello, Rust!");
+    /// # use core::ptr::NonNull;
+    /// # use gstr::RawBuffer;
+    /// # unsafe {
+    /// #     drop(GStr::from_raw_parts(
+    /// #         RawBuffer::Heap(NonNull::new_unchecked(static_ref.as_ptr().cast_mut())),
+    /// #         static_ref.len(),
+    /// #     ));
+    /// # }
+    /// ```
     #[inline]
     #[must_use]
     pub const fn leak<'a>(self) -> &'a str {
@@ -950,29 +1559,56 @@ impl GStr {
         mem::forget(self);
 
         unsafe { core::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
-    }
+    } */
 
+    #[cfg(target_pointer_width = "32")]
+    /// Returns whether the prefix buffers is equal.
     #[inline]
-    fn cmp_prefix(&self, other: &Self) -> Ordering {
-        self.prefix_and_len.cmp_prefix(other.prefix_and_len)
+    const fn prefix_eq(&self, other: &Self) -> bool {
+        self.prefix_and_len.prefix_eq(other.prefix_and_len)
     }
 
+    /// Compares the prefix buffers.
+    #[inline]
+    fn prefix_cmp(&self, other: &Self) -> Ordering {
+        self.prefix_and_len.prefix_cmp(other.prefix_and_len)
+    }
+
+    /// Concatenates two strings to a new [`GStr`].
+    ///
     /// # Panics
     ///
-    /// - Panics if the total length of `self` and `string` is greater than
+    /// - Panics if the total length in bytes of `self` and `string` is greater than
     ///   [`MAX_LENGTH`](Self::MAX_LENGTH).
     /// - Panics if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string1 = GStr::new("Hello ");
+    /// let string2 = string1.concat("World!");
+    /// assert_eq!(string2, "Hello World!");
+    /// ```
     #[must_use]
     pub fn concat<S: AsRef<str>>(&self, string: S) -> Self {
         let a = self.as_str();
         let b = string.as_ref();
         let total_len = a.len() + b.len();
 
-        let mut s = String::with_capacity(total_len);
-        s.push_str(a);
-        s.push_str(b);
+        if total_len <= Self::MAX_LENGTH {
+            let mut s = String::with_capacity(total_len);
+            s.push_str(a);
+            s.push_str(b);
 
-        Self::from_string(s)
+            Self::from_string(s)
+        } else {
+            panic!(
+                "The total length in bytes of two strings shouldn't be greater than `GStr`'s max length {}",
+                GStr::MAX_LENGTH
+            );
+        }
     }
 }
 
@@ -982,6 +1618,10 @@ impl Drop for GStr {
         if self.is_heap() {
             debug_assert!(!self.is_empty());
 
+            // SAFETY:
+            // - The layout of the string buffer is valid.
+            // - `self.as_mut_ptr()` points to a memory allocated by the global allocator with the
+            //   string buffer's layout.
             unsafe {
                 alloc::alloc::dealloc(
                     self.as_mut_ptr(),
@@ -1036,6 +1676,8 @@ impl Clone for GStr {
     #[inline]
     fn clone(&self) -> Self {
         if self.is_heap() {
+            // SAFETY: The string isn't empty if it's heap allocated. This assertion can remove some
+            //         branches.
             unsafe {
                 core::hint::assert_unchecked(!self.is_empty());
             }
@@ -1060,8 +1702,25 @@ impl Default for GStr {
 impl PartialEq for GStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Test if this two strings's lengths and the prefix buffers are equal.
+        #[cfg(target_pointer_width = "64")]
+        // Test if this two strings's lengths and the prefix buffers are equal at the same time.
         if self.as_prefix_len_u64() == other.as_prefix_len_u64() {
+            debug_assert_eq!(self.len(), other.len());
+            debug_assert_eq!(self.prefix(), other.prefix());
+
+            let len = self.len();
+            // SAFETY: The length of `self`'s string buffer is `len`.
+            let a = unsafe { slice::from_raw_parts(self.as_ptr(), len) };
+            // SAFETY: The length of `other`'s string buffer is `len`.
+            let b = unsafe { slice::from_raw_parts(other.as_ptr(), len) };
+
+            a == b
+        } else {
+            false
+        }
+
+        #[cfg(target_pointer_width = "32")]
+        if self.len() == other.len() && self.prefix_eq(other) {
             debug_assert_eq!(self.len(), other.len());
             debug_assert_eq!(self.prefix(), other.prefix());
 
@@ -1090,7 +1749,7 @@ impl PartialOrd for GStr {
 impl Ord for GStr {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.cmp_prefix(other) {
+        match self.prefix_cmp(other) {
             Ordering::Equal => self.as_bytes().cmp(other.as_bytes()),
             not_eq => not_eq,
         }
@@ -1476,6 +2135,8 @@ impl FromIterator<GStr> for Cow<'_, str> {
 ///
 /// If the length of `bytes` is less than [`PREFIX_LENGTH`](GStr::PREFIX_LENGTH), the remaining
 /// bytes are filled with 0.
+// NOTE: If the compiler can't confirm that `bytes` isn't empty, this function will have an extra
+//       branch.
 #[inline]
 const fn copy_prefix(bytes: &[u8]) -> [u8; PrefixAndLength::PREFIX_LENGTH] {
     let mut prefix = [0u8; PrefixAndLength::PREFIX_LENGTH];
@@ -1537,7 +2198,7 @@ unsafe fn shrink_and_leak_string(string: String) -> Result<&'static mut str, Str
             // SAFETY:
             // - `ptr` is the pointer of `string`'s inner buffer, so it was allocated by the global
             //   allocator.
-            // - `layout` is the layout of `string`'s inner buffer.
+            // - `layout` is the layout of `string`'s inner buffer and its size is greater than 0.
             // - The length of `string` is guaranteed to be greater than 0.
             // - `len` doesn't overflows `isize`.
             let new_ptr = unsafe { alloc::alloc::realloc(ptr, layout, len) };
@@ -1591,30 +2252,34 @@ pub(crate) fn handle_alloc_error<B: AsRef<[u8]>>(buf: B) -> ! {
 
 const _: () = {
     assert!(size_of::<PrefixAndLength>() == size_of::<u64>());
-    assert!(align_of::<PrefixAndLength>() == align_of::<u64>());
 
     #[cfg(target_pointer_width = "64")]
     {
+        assert!(align_of::<PrefixAndLength>() == align_of::<u64>());
+
         assert!(size_of::<GStr>() == 4 * size_of::<u32>());
         assert!(size_of::<Option<GStr>>() == 4 * size_of::<u32>());
+
+        assert!(PrefixAndLength::HALF_BITS == 32);
+        assert!(PrefixAndLength::PREFIX_MASK == 0xFFFF_FFFF_0000_0000);
+        assert!(PrefixAndLength::LEN_PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
     }
 
     #[cfg(target_pointer_width = "32")]
     {
+        assert!(align_of::<PrefixAndLength>() == align_of::<u32>());
+
         assert!(size_of::<GStr>() == 3 * size_of::<u32>());
         assert!(size_of::<Option<GStr>>() == 3 * size_of::<u32>());
     }
 
-    assert!(align_of::<GStr>() == align_of::<u64>());
+    assert!(align_of::<GStr>() == align_of::<usize>());
 
     assert!(PrefixAndLength::PREFIX_LENGTH == 4);
-    assert!(PrefixAndLength::HALF_BITS == 32);
-    assert!(PrefixAndLength::PREFIX_MASK == 0xFFFF_FFFF_0000_0000);
     assert!(PrefixAndLength::LENGTH_BITS == 31);
     assert!(PrefixAndLength::STATIC_MASK == 0x8000_0000);
     assert!(PrefixAndLength::LENGTH_MASK == 0x7FFF_FFFF);
     assert!(PrefixAndLength::MAX_LENGTH == 0x7FFF_FFFF);
-    assert!(PrefixAndLength::LEN_PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
 
     assert!(GStr::MAX_LENGTH == PrefixAndLength::MAX_LENGTH);
     assert!(GStr::MAX_LENGTH <= isize::MAX as _);
@@ -1765,13 +2430,115 @@ mod tests {
         assert_eq!(gstr_b.partial_cmp(a), b.partial_cmp(&gstr_a));
     }
 
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    fn test_gstr_valid_utf8(string: String) {
+        let gstr = GStr::from_utf8(string.clone().into_bytes()).unwrap();
+        assert_eq!(gstr, string);
+
+        let gstr = GStr::from_utf8_lossy(string.clone().into_bytes());
+        assert_eq!(gstr, string);
+
+        // SAFETY: `string` is valid UTF-8.
+        let gstr = unsafe { GStr::from_utf8_unchecked(string.clone().into_bytes()) };
+        assert_eq!(gstr, string);
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    fn test_gstr_utf8_bytes(bytes: Vec<u8>) {
+        let gstr = GStr::from_utf8(bytes.clone());
+        let string = String::from_utf8(bytes.clone());
+        if let Ok(string) = string {
+            assert_eq!(string, gstr.unwrap());
+
+            // SAFETY: `bytes` is valid UTF-8.
+            let gstr = unsafe { GStr::from_utf8_unchecked(bytes.clone()) };
+            assert_eq!(gstr, string);
+        } else {
+            assert!(gstr.is_err());
+        }
+
+        let gstr = GStr::from_utf8_lossy(bytes.clone());
+        let string = String::from_utf8_lossy(&bytes);
+        assert_eq!(gstr, string);
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    fn test_gstr_valid_utf16(string: String) {
+        let bytes = string.encode_utf16().collect::<Vec<_>>();
+        let gstr = GStr::from_utf16(&bytes).unwrap();
+        assert_eq!(gstr, string);
+
+        let gstr = GStr::from_utf16_lossy(&bytes);
+        assert_eq!(gstr, string);
+
+        let utf16_le = bytes
+            .iter()
+            .flat_map(|n| n.to_le_bytes())
+            .collect::<Vec<_>>();
+        let gstr = GStr::from_utf16le(&utf16_le).unwrap();
+        assert_eq!(gstr, string);
+        let gstr = GStr::from_utf16le_lossy(&utf16_le);
+        assert_eq!(gstr, string);
+
+        let utf16_be = bytes
+            .iter()
+            .flat_map(|n| n.to_be_bytes())
+            .collect::<Vec<_>>();
+        let gstr = GStr::from_utf16be(&utf16_be).unwrap();
+        assert_eq!(gstr, string);
+        let gstr = GStr::from_utf16be_lossy(&utf16_be);
+        assert_eq!(gstr, string);
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    fn test_gstr_utf16_u16_bytes(bytes: Vec<u16>) {
+        let gstr = GStr::from_utf16(&bytes);
+        let string = String::from_utf16(&bytes);
+        if let Ok(string) = string {
+            assert_eq!(string, gstr.unwrap());
+        } else {
+            assert!(gstr.is_err());
+        }
+
+        let gstr = GStr::from_utf16_lossy(&bytes);
+        let string = String::from_utf16_lossy(&bytes);
+        assert_eq!(gstr, string);
+    }
+
+    #[cfg(any(feature = "nightly_test", feature = "proptest_miri"))]
+    fn test_gstr_utf16_u8_bytes(bytes: Vec<u8>) {
+        let string = String::from_utf16le(&bytes);
+        let gstr = GStr::from_utf16le(&bytes);
+        if let Ok(string) = string {
+            assert_eq!(string, gstr.unwrap());
+        } else {
+            assert!(gstr.is_err());
+        }
+
+        let string = String::from_utf16le_lossy(&bytes);
+        let gstr = GStr::from_utf16le_lossy(&bytes);
+        assert_eq!(string, gstr);
+
+        let string = String::from_utf16be(&bytes);
+        let gstr = GStr::from_utf16be(&bytes);
+        if let Ok(string) = string {
+            assert_eq!(string, gstr.unwrap());
+        } else {
+            assert!(gstr.is_err());
+        }
+
+        let string = String::from_utf16be_lossy(&bytes);
+        let gstr = GStr::from_utf16be_lossy(&bytes);
+        assert_eq!(string, gstr);
+    }
+
     #[test]
     fn gstr_new() {
         test_literal_strings(test_gstr_new);
     }
 
     #[test]
-    fn gstr_const_new() {
+    fn gstr_from_static() {
         test_literal_strings(test_gstr_const_new);
     }
 
@@ -1809,7 +2576,7 @@ mod tests {
     #[cfg(any(not(miri), feature = "proptest_miri"))]
     proptest! {
         #[test]
-        fn prop_gstr_const_new(string: String) {
+        fn prop_gstr_from_static(string: String) {
             let len = string.len();
             let capacity = string.capacity();
             let string = string.leak();
@@ -1838,6 +2605,46 @@ mod tests {
         #[test]
         fn prop_gstr_eq_cmp(a: String, b: String) {
             test_gstr_eq_cmp(&a, &b);
+        }
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_valid_utf8(string: String) {
+            test_gstr_valid_utf8(string);
+        }
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_utf8_bytes(bytes: Vec<u8>) {
+            test_gstr_utf8_bytes(bytes);
+        }
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_valid_utf16(string: String) {
+            test_gstr_valid_utf16(string);
+        }
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_utf16_u16_bytes(bytes: Vec<u16>) {
+            test_gstr_utf16_u16_bytes(bytes);
+        }
+    }
+
+    #[cfg(any(feature = "nightly_test", feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_utf16_u8_bytes(bytes: Vec<u8>) {
+            test_gstr_utf16_u8_bytes(bytes);
         }
     }
 }

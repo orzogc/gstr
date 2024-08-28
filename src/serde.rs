@@ -48,6 +48,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
             Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
                 ErrorKind::AllocationFailure => crate::handle_alloc_error(e),
+                // SAFETY: `GStr::try_new` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
         }
@@ -62,6 +63,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
             Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
                 ErrorKind::AllocationFailure => crate::handle_alloc_error(e),
+                // SAFETY: `GStr::try_from_string` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
         }
@@ -93,6 +95,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
                 ErrorKind::Utf8Error(_) => {
                     Err(Error::invalid_value(Unexpected::Bytes(e.source()), &self))
                 }
+                // SAFETY: `GStr::from_utf8` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
         }

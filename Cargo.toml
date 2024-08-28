@@ -8,8 +8,10 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["std"]
-# For running proptest in MIRI
-proptest_miri = []
+# For running tests on nightly.
+nightly_test = []
+# For running proptest in MIRI.
+proptest_miri = ["nightly_test"]
 serde = ["dep:serde"]
 rkyv = ["dep:rkyv"]
 std = []

@@ -8,10 +8,10 @@ use rand::{
 
 use gstr::GStr;
 
-fn random_string() -> (Vec<GStr>, Vec<String>) {
-    const STRING_MAX_LENGTH: usize = 256;
-    const STRINGS_COUNT: usize = 64;
+const STRING_MAX_LENGTH: usize = 256;
+const STRINGS_COUNT: usize = 64;
 
+fn random_string() -> (Vec<GStr>, Vec<String>) {
     let mut rng = rand::thread_rng();
 
     let strings: Vec<String> = (0..STRINGS_COUNT)
@@ -20,6 +20,17 @@ fn random_string() -> (Vec<GStr>, Vec<String>) {
 
             Alphanumeric.sample_string(&mut rng, len)
         })
+        .collect();
+    let gstrs = strings.iter().map(GStr::new).collect::<Vec<_>>();
+
+    (gstrs, strings)
+}
+
+fn fixed_length_random_string() -> (Vec<GStr>, Vec<String>) {
+    let mut rng = rand::thread_rng();
+
+    let strings: Vec<String> = (0..STRINGS_COUNT)
+        .map(|_| Alphanumeric.sample_string(&mut rng, STRING_MAX_LENGTH))
         .collect();
     let gstrs = strings.iter().map(GStr::new).collect::<Vec<_>>();
 
@@ -109,6 +120,46 @@ fn random_string_equality(c: &mut Criterion) {
     );
 }
 
+fn fixed_length_random_string_equality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Fixed-Length Random String Equality");
+    let (gstrs, strings) = fixed_length_random_string();
+
+    group.bench_with_input(BenchmarkId::new("GStr", ""), &gstrs, |b, gstrs| {
+        b.iter(|| {
+            for i in 0..gstrs.len() {
+                for j in i..gstrs.len() {
+                    black_box(gstrs[i] == gstrs[j]);
+                }
+            }
+        });
+    });
+
+    group.bench_with_input(BenchmarkId::new("String", ""), &strings, |b, strings| {
+        b.iter(|| {
+            for i in 0..strings.len() {
+                for j in i..strings.len() {
+                    black_box(strings[i] == strings[j]);
+                }
+            }
+        });
+    });
+
+    group.bench_with_input(
+        BenchmarkId::new("Gstr and String", ""),
+        &(gstrs, strings),
+        |b, (gstrs, strings)| {
+            b.iter(|| {
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..gstrs.len() {
+                    for j in i..strings.len() {
+                        black_box(gstrs[i] == strings[j]);
+                    }
+                }
+            });
+        },
+    );
+}
+
 fn random_string_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("Random String Comparison");
     let (gstrs, strings) = random_string();
@@ -154,6 +205,7 @@ criterion_group!(string_access, fixed_string_access, random_string_access);
 criterion_group!(
     string_comparison,
     random_string_equality,
+    fixed_length_random_string_equality,
     random_string_comparison
 );
 
