@@ -236,39 +236,54 @@ impl RawBuffer {
     }
 }
 
-/// The length of [`GStr`].
-///
-/// If the most significant bit is 1, then the string buffer is static.
-///
-/// The actual length is the value of the wrapped [`u32`] ignoring the static flag.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
-struct Length(u32);
+struct PrefixAndLength(u64);
 
-impl Length {
+impl PrefixAndLength {
+    /// The length of the prefix buffer (`4`).
+    const PREFIX_LENGTH: usize = size_of::<u32>();
+
+    /// The half length of [`PrefixAndLength`] in bits (`32`).
+    const HALF_BITS: u8 = u32::BITS as _;
+
+    /// A mask that isolates the prefix part of the value (`0xFFFF_FFFF_0000_0000`).
+    const PREFIX_MASK: u64 = (u32::MAX as u64) << Self::HALF_BITS;
+
     /// The number of bits used to represent the length (`31`).
-    const LENGTH_BITS: u8 = (size_of::<Self>() * 8 - 1) as _;
-
-    /// A mask that isolates the length part of the value (`0x7FFF_FFFF`).
-    const LENGTH_MASK: u32 = (1 << Self::LENGTH_BITS) - 1;
+    const LENGTH_BITS: u8 = Self::HALF_BITS - 1;
 
     /// A mask intended to set the static flag (`0x8000_0000`).
-    const STATIC_MASK: u32 = !Self::LENGTH_MASK;
+    const STATIC_MASK: u64 = 1 << Self::LENGTH_BITS;
+
+    /// A mask that isolates the length part of the value (`0x7FFF_FFFF`).
+    const LENGTH_MASK: u64 = Self::STATIC_MASK - 1;
 
     /// The maximum length (`0x7FFF_FFFF`).
     const MAX_LENGTH: usize = Self::LENGTH_MASK as _;
 
-    /// Creates a new [`Length`] for non-static strings.
+    /// A mask for [`PrefixAndLength`] to set the static flag as 0 (`0xFFFF_FFFF_7FFF_FFFF`).
+    const LEN_PREFIX_MASK: u64 = !Self::STATIC_MASK;
+}
+
+impl PrefixAndLength {
+    /// Creates a new [`PrefixAndLength`] for non-static strings.
     ///
     /// # Safety
     ///
     /// - `len` must not be greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - The returned [`Length`] is for non-static strings.
+    /// - The returned [`PrefixAndLength`] is for non-static strings.
     #[inline]
-    const unsafe fn new_unchecked(len: usize) -> Self {
+    const unsafe fn new_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
         debug_assert!(len <= Self::MAX_LENGTH);
 
-        Self(len as _)
+        #[cfg(target_endian = "little")]
+        let array = [len as u32, u32::from_be_bytes(prefix)];
+
+        #[cfg(target_endian = "big")]
+        let array = [u32::from_be_bytes(prefix), len as u32];
+
+        unsafe { Self(mem::transmute::<[u32; 2], u64>(array)) }
     }
 
     /// Creates a new [`Length`] for static strings.
@@ -278,10 +293,15 @@ impl Length {
     /// - `len` must not be greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
     /// - The returned [`Length`] is for static strings.
     #[inline]
-    const unsafe fn new_static_unchecked(len: usize) -> Self {
-        debug_assert!(len <= Self::MAX_LENGTH);
+    const unsafe fn new_static_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
+        let prefix_and_len = unsafe { Self::new_unchecked(prefix, len) };
 
-        Self(len as u32 | Self::STATIC_MASK)
+        Self(prefix_and_len.0 | Self::STATIC_MASK)
+    }
+
+    #[inline]
+    const fn as_prefix(self) -> [u8; Self::PREFIX_LENGTH] {
+        ((self.0 >> Self::HALF_BITS) as u32).to_be_bytes()
     }
 
     /// Returns the actual length.
@@ -290,51 +310,45 @@ impl Length {
         (self.0 & Self::LENGTH_MASK) as _
     }
 
-    /// Indicates whether the string is a heap allocated string.
     #[inline]
-    const fn is_heap(self) -> bool {
-        self.0 <= Self::LENGTH_MASK
+    const fn as_prefix_len_u64(self) -> u64 {
+        self.0 & Self::LEN_PREFIX_MASK
     }
 
-    /// Indicates whether the string is a static string.
+    /// Indicates whether the string buffer is static.
     #[inline]
     const fn is_static(self) -> bool {
         !self.is_heap()
     }
+
+    /// Indicates whether the string buffer is heap allocated.
+    #[inline]
+    const fn is_heap(self) -> bool {
+        (self.0 as u32) <= Self::LENGTH_MASK as u32
+    }
+
+    #[inline]
+    fn cmp_prefix(self, other: Self) -> Ordering {
+        (self.0 & Self::PREFIX_MASK).cmp(&(other.0 & Self::PREFIX_MASK))
+    }
 }
 
 /// An immutable string optimized for small strings and comparison.
-#[repr(C)]
 pub struct GStr {
     /// The pointer which points to the string buffer.
     ptr: NonNull<u8>,
-    #[cfg(target_endian = "little")]
-    /// The length of the string buffer.
-    len: Length,
-    /// The first 4 bytes of the string buffer. If the string's length is less than
-    /// [`PREFIX_LENGTH`](Self::PREFIX_LENGTH), the remaining bytes will be filled with 0.
-    prefix: [u8; Self::PREFIX_LENGTH],
-    #[cfg(target_endian = "big")]
-    /// The length of the string buffer.
-    len: Length,
+    prefix_and_len: PrefixAndLength,
 }
 
 impl GStr {
-    /// The length of the prefix buffer.
-    const PREFIX_LENGTH: usize = 4;
-
     /// The maximum length of [`GStr`].
-    pub const MAX_LENGTH: usize = Length::MAX_LENGTH;
+    pub const MAX_LENGTH: usize = PrefixAndLength::MAX_LENGTH;
 
     /// The empty string of [`GStr`].
     pub const EMPTY: Self = Self::from_static("");
 
     /// The UTF-8 character used to replace invalid UTF-8 sequences.
     const UTF8_REPLACEMENT: &'static str = "\u{FFFD}";
-
-    /// A mask for [`GStr`]'s `len` and `prefix` to set the static flag as 0
-    /// (`0xFFFF_FFFF_7FFF_FFFF`).
-    const LEN_PREFIX_MASK: u64 = !(Length::STATIC_MASK as u64);
 
     /// Creates a [`GStr`] from a string.
     ///
@@ -372,8 +386,9 @@ impl GStr {
                     // SAFETY: `ptr` isn't null.
                     ptr: unsafe { NonNull::new_unchecked(ptr) },
                     // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
-                    len: unsafe { Length::new_unchecked(len) },
-                    prefix: copy_prefix(s.as_bytes()),
+                    prefix_and_len: unsafe {
+                        PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
+                    },
                 })
             }
         } else {
@@ -432,8 +447,12 @@ impl GStr {
                 // SAFETY: The pointer which points to `string`'s buffer is non-null.
                 ptr: unsafe { NonNull::new_unchecked(string.as_ptr().cast_mut()) },
                 // SAFETY: `string.len()` isn't greater than `Length::MAX_LENGTH`.
-                len: unsafe { Length::new_static_unchecked(string.len()) },
-                prefix: copy_prefix(string.as_bytes()),
+                prefix_and_len: unsafe {
+                    PrefixAndLength::new_static_unchecked(
+                        copy_prefix(string.as_bytes()),
+                        string.len(),
+                    )
+                },
             }
         } else {
             panic!("the string's length should not be greater than `GStr`'s max length")
@@ -460,14 +479,17 @@ impl GStr {
             // SAFETY: `string` isn't empty.
             match unsafe { shrink_and_leak_string(string) } {
                 Ok(s) => {
-                    debug_assert_eq!(s.len(), len);
+                    unsafe {
+                        core::hint::assert_unchecked(s.len() == len);
+                    }
 
                     Ok(Self {
                         // SAFETY: The pointer which points to the string buffer is non-null.
                         ptr: unsafe { NonNull::new_unchecked(s.as_mut_ptr()) },
                         // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
-                        len: unsafe { Length::new_unchecked(len) },
-                        prefix: copy_prefix(s.as_bytes()),
+                        prefix_and_len: unsafe {
+                            PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
+                        },
                     })
                 }
                 Err(s) => allocation_failure(s),
@@ -511,20 +533,31 @@ impl GStr {
     pub const unsafe fn from_raw_parts(buf: RawBuffer, len: usize) -> Self {
         debug_assert!(len <= Self::MAX_LENGTH);
 
-        let (ptr, length) = match buf {
-            RawBuffer::Static(ptr) => (ptr, unsafe { Length::new_static_unchecked(len) }),
-            RawBuffer::Heap(ptr) => {
-                debug_assert!(len > 0);
+        match buf {
+            RawBuffer::Static(ptr) => {
+                let bytes = unsafe { slice::from_raw_parts(ptr.as_ptr(), len) };
 
-                (ptr, unsafe { Length::new_unchecked(len) })
+                Self {
+                    ptr,
+                    prefix_and_len: unsafe {
+                        PrefixAndLength::new_static_unchecked(copy_prefix(bytes), len)
+                    },
+                }
             }
-        };
-        let bytes = unsafe { slice::from_raw_parts(ptr.as_ptr(), len) };
+            RawBuffer::Heap(ptr) => {
+                unsafe {
+                    core::hint::assert_unchecked(len > 0);
+                }
 
-        Self {
-            ptr,
-            len: length,
-            prefix: copy_prefix(bytes),
+                let bytes = unsafe { slice::from_raw_parts(ptr.as_ptr(), len) };
+
+                Self {
+                    ptr,
+                    prefix_and_len: unsafe {
+                        PrefixAndLength::new_unchecked(copy_prefix(bytes), len)
+                    },
+                }
+            }
         }
     }
 
@@ -738,6 +771,11 @@ impl GStr {
         }
     }
 
+    #[inline]
+    const fn prefix(&self) -> [u8; PrefixAndLength::PREFIX_LENGTH] {
+        self.prefix_and_len.as_prefix()
+    }
+
     /// Returns the length of this [`GStr`], in bytes, not chars or graphemes.
     ///
     /// # Examples
@@ -754,7 +792,7 @@ impl GStr {
     #[inline]
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.len.as_len()
+        self.prefix_and_len.as_len()
     }
 
     /// Returns `true` if this string's length is zero, and `false` otherwise.
@@ -774,47 +812,19 @@ impl GStr {
 
     #[inline]
     #[must_use]
-    pub const fn is_heap(&self) -> bool {
-        self.len.is_heap()
+    pub const fn is_static(&self) -> bool {
+        self.prefix_and_len.is_static()
     }
 
     #[inline]
     #[must_use]
-    pub const fn is_static(&self) -> bool {
-        self.len.is_static()
+    pub const fn is_heap(&self) -> bool {
+        self.prefix_and_len.is_heap()
     }
 
-    /// Returns the length and the prefix buffer of this [`GStr`] as a [`u64`].
     #[inline]
-    const fn as_len_prefix_u64(&self) -> u64 {
-        #[cfg(target_pointer_width = "64")]
-        // SAFETY:
-        // - `GStr` is valid for reading its last 8 bytes as `u64`.
-        // - `GStr` is properly initialized.
-        // - `GStr`'s alignment is the same as `u64`, then the last 8 bytes is aligned.
-        unsafe {
-            ptr::read(
-                ptr::from_ref(self)
-                    .cast::<u8>()
-                    .byte_add(size_of::<NonNull<u8>>())
-                    .cast::<u64>(),
-            ) & Self::LEN_PREFIX_MASK
-        }
-
-        #[cfg(target_pointer_width = "32")]
-        // SAFETY:
-        // - `GStr` is valid for reading its last 8 bytes as `u64`.
-        // - `GStr` is properly initialized.
-        // - `GStr`'s alignment is 4 and `u64`'s alignment is 8, the last 8 bytes maybe unaligned,
-        //   so `ptr::read_unaligned` is used.
-        unsafe {
-            ptr::read_unaligned(
-                ptr::from_ref(self)
-                    .cast::<u8>()
-                    .byte_add(size_of::<NonNull<u8>>())
-                    .cast::<u64>(),
-            ) & Self::LEN_PREFIX_MASK
-        }
+    const fn as_prefix_len_u64(&self) -> u64 {
+        self.prefix_and_len.as_prefix_len_u64()
     }
 
     #[inline]
@@ -861,6 +871,8 @@ impl GStr {
         let len = string.len();
 
         if string.is_heap() {
+            debug_assert!(len > 0);
+
             unsafe { Ok(String::from_raw_parts(string.as_mut_ptr(), len, len)) }
         } else {
             let ptr = unsafe { alloc::alloc::alloc(Layout::array::<u8>(len).unwrap_unchecked()) };
@@ -921,7 +933,7 @@ impl GStr {
         let buf = if self.is_static() {
             RawBuffer::Static(self.ptr)
         } else {
-            debug_assert!(self.is_heap());
+            debug_assert!(self.is_heap() && !self.is_empty());
 
             RawBuffer::Heap(self.ptr)
         };
@@ -938,6 +950,11 @@ impl GStr {
         mem::forget(self);
 
         unsafe { core::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
+    }
+
+    #[inline]
+    fn cmp_prefix(&self, other: &Self) -> Ordering {
+        self.prefix_and_len.cmp_prefix(other.prefix_and_len)
     }
 
     /// # Panics
@@ -963,6 +980,8 @@ impl Drop for GStr {
     #[inline]
     fn drop(&mut self) {
         if self.is_heap() {
+            debug_assert!(!self.is_empty());
+
             unsafe {
                 alloc::alloc::dealloc(
                     self.as_mut_ptr(),
@@ -1001,7 +1020,7 @@ impl fmt::Debug for GStr {
         f.debug_struct("GStr")
             .field("is_static", &self.is_static())
             .field("len", &self.len())
-            .field("prefix", &self.prefix)
+            .field("prefix", &self.prefix())
             .field("str", &self.as_str())
             .finish()
     }
@@ -1017,12 +1036,15 @@ impl Clone for GStr {
     #[inline]
     fn clone(&self) -> Self {
         if self.is_heap() {
+            unsafe {
+                core::hint::assert_unchecked(!self.is_empty());
+            }
+
             Self::new(self)
         } else {
             Self {
-                len: self.len,
-                prefix: self.prefix,
                 ptr: self.ptr,
+                prefix_and_len: self.prefix_and_len,
             }
         }
     }
@@ -1039,9 +1061,9 @@ impl PartialEq for GStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         // Test if this two strings's lengths and the prefix buffers are equal.
-        if self.as_len_prefix_u64() == other.as_len_prefix_u64() {
+        if self.as_prefix_len_u64() == other.as_prefix_len_u64() {
             debug_assert_eq!(self.len(), other.len());
-            debug_assert_eq!(self.prefix, other.prefix);
+            debug_assert_eq!(self.prefix(), other.prefix());
 
             let len = self.len();
             // SAFETY: The length of `self`'s string buffer is `len`.
@@ -1068,7 +1090,7 @@ impl PartialOrd for GStr {
 impl Ord for GStr {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.prefix.cmp(&other.prefix) {
+        match self.cmp_prefix(other) {
             Ordering::Equal => self.as_bytes().cmp(other.as_bytes()),
             not_eq => not_eq,
         }
@@ -1455,13 +1477,13 @@ impl FromIterator<GStr> for Cow<'_, str> {
 /// If the length of `bytes` is less than [`PREFIX_LENGTH`](GStr::PREFIX_LENGTH), the remaining
 /// bytes are filled with 0.
 #[inline]
-const fn copy_prefix(bytes: &[u8]) -> [u8; GStr::PREFIX_LENGTH] {
-    let mut prefix = [0u8; GStr::PREFIX_LENGTH];
+const fn copy_prefix(bytes: &[u8]) -> [u8; PrefixAndLength::PREFIX_LENGTH] {
+    let mut prefix = [0u8; PrefixAndLength::PREFIX_LENGTH];
     let mut i = 0;
-    let len = if bytes.len() < GStr::PREFIX_LENGTH {
+    let len = if bytes.len() < PrefixAndLength::PREFIX_LENGTH {
         bytes.len()
     } else {
-        GStr::PREFIX_LENGTH
+        PrefixAndLength::PREFIX_LENGTH
     };
 
     while i < len {
@@ -1500,15 +1522,15 @@ unsafe fn shrink_and_leak_string(string: String) -> Result<&'static mut str, Str
         #[cold]
         #[inline(never)]
         unsafe fn realloc_string(string: String) -> Result<&'static mut str, String> {
-            let mut s = ManuallyDrop::new(string);
-            let len = s.len();
-            let capacity = s.capacity();
-            // Not using `s.as_mut_ptr()` to get the raw pointer because it only covers `len` bytes
-            // under the Stacked Borrows rules. Reallocating the memory requires the raw pointer
-            // covers `capacity` bytes.
+            let mut string = ManuallyDrop::new(string);
+            let len = string.len();
+            let capacity = string.capacity();
+            // Not using `string.as_mut_ptr()` to get the raw pointer because it only covers `len`
+            // bytes under the Stacked Borrows rules. Reallocating the memory requires the raw
+            // pointer covers `capacity` bytes.
             // SAFETY: We just get the raw pointer from `string`'s inner buffer, not mutating its
             //         content.
-            let ptr = unsafe { s.as_mut_vec().as_mut_ptr() };
+            let ptr = unsafe { string.as_mut_vec().as_mut_ptr() };
             // SAFETY: The layout of string's inner buffer is valid.
             let layout = unsafe { Layout::array::<u8>(capacity).unwrap_unchecked() };
 
@@ -1521,7 +1543,7 @@ unsafe fn shrink_and_leak_string(string: String) -> Result<&'static mut str, Str
             let new_ptr = unsafe { alloc::alloc::realloc(ptr, layout, len) };
 
             if new_ptr.is_null() {
-                Err(ManuallyDrop::into_inner(s))
+                Err(ManuallyDrop::into_inner(string))
             } else {
                 // SAFETY:
                 // - `new_ptr` points to a valid UTF-8 string buffer whose length is `len`.
@@ -1568,7 +1590,8 @@ pub(crate) fn handle_alloc_error<B: AsRef<[u8]>>(buf: B) -> ! {
 }
 
 const _: () = {
-    assert!(size_of::<Length>() == size_of::<u32>());
+    assert!(size_of::<PrefixAndLength>() == size_of::<u64>());
+    assert!(align_of::<PrefixAndLength>() == align_of::<u64>());
 
     #[cfg(target_pointer_width = "64")]
     {
@@ -1582,21 +1605,19 @@ const _: () = {
         assert!(size_of::<Option<GStr>>() == 3 * size_of::<u32>());
     }
 
-    assert!(align_of::<GStr>() == align_of::<usize>());
+    assert!(align_of::<GStr>() == align_of::<u64>());
 
-    assert!(Length::LENGTH_BITS == 31);
-    assert!(Length::LENGTH_MASK == 0x7FFF_FFFF);
-    assert!(Length::STATIC_MASK == 0x8000_0000);
-    assert!(Length::MAX_LENGTH == 0x7FFF_FFFF);
+    assert!(PrefixAndLength::PREFIX_LENGTH == 4);
+    assert!(PrefixAndLength::HALF_BITS == 32);
+    assert!(PrefixAndLength::PREFIX_MASK == 0xFFFF_FFFF_0000_0000);
+    assert!(PrefixAndLength::LENGTH_BITS == 31);
+    assert!(PrefixAndLength::STATIC_MASK == 0x8000_0000);
+    assert!(PrefixAndLength::LENGTH_MASK == 0x7FFF_FFFF);
+    assert!(PrefixAndLength::MAX_LENGTH == 0x7FFF_FFFF);
+    assert!(PrefixAndLength::LEN_PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
 
-    assert!(GStr::PREFIX_LENGTH == 4);
-    assert!(GStr::MAX_LENGTH == Length::MAX_LENGTH);
+    assert!(GStr::MAX_LENGTH == PrefixAndLength::MAX_LENGTH);
     assert!(GStr::MAX_LENGTH <= isize::MAX as _);
-
-    #[cfg(target_endian = "little")]
-    assert!(GStr::LEN_PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
-    #[cfg(target_endian = "big")]
-    assert!(GStr::LEN_PREFIX_MASK == 0x7FFF_FFFF_FFFF_FFFF);
 };
 
 #[cfg(test)]
@@ -1650,11 +1671,11 @@ mod tests {
 
         let bytes = b.as_bytes();
         #[allow(clippy::needless_range_loop)]
-        for i in 0..(bytes.len().min(GStr::PREFIX_LENGTH)) {
-            assert_eq!(a.prefix[i], bytes[i]);
+        for i in 0..(bytes.len().min(PrefixAndLength::PREFIX_LENGTH)) {
+            assert_eq!(a.prefix()[i], bytes[i]);
         }
-        for i in bytes.len()..GStr::PREFIX_LENGTH {
-            assert_eq!(a.prefix[i], 0);
+        for i in bytes.len()..PrefixAndLength::PREFIX_LENGTH {
+            assert_eq!(a.prefix()[i], 0);
         }
     }
 
