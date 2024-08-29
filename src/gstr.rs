@@ -480,8 +480,8 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns a [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH) or
-    /// allocation failure occurs.
+    /// Returns an [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
+    /// or allocation failure occurs.
     ///
     /// # Example
     ///
@@ -600,8 +600,8 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns a [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH) or
-    /// shrinking the string's capacity fails.
+    /// Returns an [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
+    /// or shrinking the string's capacity fails.
     ///
     /// # Example
     ///
@@ -754,8 +754,8 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// - Returns a [`Err`] if the slice is not a valid UTF-8 sequence.
-    /// - Returns a [`Err`] if the slice's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
+    /// - Returns an [`Err`] if the slice is not a valid UTF-8 sequence.
+    /// - Returns an [`Err`] if the slice's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
     ///   or shrinking the vector's capacity fails.
     ///
     /// # Examples
@@ -872,8 +872,8 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// - Returns a [`Err`] if the slice contains any invalid UTF-16 sequences.
-    /// - Returns a [`Err`] if length in bytes of the UTF-8 sequence converted is greater than
+    /// - Returns an [`Err`] if the slice contains any invalid UTF-16 sequences.
+    /// - Returns an [`Err`] if length in bytes of the UTF-8 sequence converted is greater than
     ///   [`MAX_LENGTH`](Self::MAX_LENGTH) or shrinking the intermediate string's capacity fails.
     ///
     /// # Panics
@@ -928,7 +928,7 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns a [`Err`] if the slice contains any invalid data.
+    /// Returns an [`Err`] if the slice contains any invalid data.
     ///
     /// # Panics
     ///
@@ -1037,7 +1037,7 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns a [`Err`] if the slice contains any invalid data.
+    /// Returns an [`Err`] if the slice contains any invalid data.
     ///
     /// # Panics
     ///
@@ -1181,6 +1181,8 @@ impl GStr {
     }
 
     /// Returns whether the string buffer of this [`GStr`] is static.
+    ///
+    /// If a [`GStr`] is empty, it is static.
     ///
     /// # Examples
     ///
@@ -1328,7 +1330,7 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns a [`Err`] containing this [`GStr`] if fails to allocate memory.
+    /// Returns an [`Err`] containing this [`GStr`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1525,42 +1527,6 @@ impl GStr {
         (buf, len)
     }
 
-    /* /// Consumes and leaks the [`GStr`], returning a string slice of its contents.
-    ///
-    /// The caller has free choice over the returned lifetime, including `'static`. Dropping the
-    /// returned string slice will cause a memory leak if the string buffer is heap-allocated.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gstr::GStr;
-    ///
-    /// let string = GStr::from_static("Hello, World!");
-    /// let static_ref: &'static str = string.leak();
-    /// assert_eq!(static_ref, "Hello, World!");
-    ///
-    /// let string = GStr::new("Hello, Rust!");
-    /// let static_ref = string.leak();
-    /// assert_eq!(static_ref, "Hello, Rust!");
-    /// # use core::ptr::NonNull;
-    /// # use gstr::RawBuffer;
-    /// # unsafe {
-    /// #     drop(GStr::from_raw_parts(
-    /// #         RawBuffer::Heap(NonNull::new_unchecked(static_ref.as_ptr().cast_mut())),
-    /// #         static_ref.len(),
-    /// #     ));
-    /// # }
-    /// ```
-    #[inline]
-    #[must_use]
-    pub const fn leak<'a>(self) -> &'a str {
-        let ptr = self.as_ptr();
-        let len = self.len();
-        mem::forget(self);
-
-        unsafe { core::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
-    } */
-
     #[cfg(target_pointer_width = "32")]
     /// Returns whether the prefix buffers is equal.
     #[inline]
@@ -1602,7 +1568,16 @@ impl GStr {
             s.push_str(a);
             s.push_str(b);
 
-            Self::from_string(s)
+            match Self::try_from_string(s) {
+                Ok(s) => s,
+                Err(e) => match e.kind {
+                    ErrorKind::AllocationFailure => handle_alloc_error(e),
+                    // SAFETY:
+                    // - `total_len` isn't greater than `GStr::MAX_LENGTH`.
+                    // - `GStr::try_from_string` doesn't return other errors.
+                    _ => unsafe { core::hint::unreachable_unchecked() },
+                },
+            }
         } else {
             panic!(
                 "The total length in bytes of two strings shouldn't be greater than `GStr`'s max length {}",
@@ -1682,7 +1657,16 @@ impl Clone for GStr {
                 core::hint::assert_unchecked(!self.is_empty());
             }
 
-            Self::new(self)
+            match Self::try_new(self) {
+                Ok(s) => s,
+                Err(e) => match e.kind {
+                    ErrorKind::AllocationFailure => handle_alloc_error(e.as_str()),
+                    // SAFETY:
+                    // - A `GStr`'s length isn't greater than `GStr::MAX_LENGTH`.
+                    // - `GStr::try_new` doesn't return other errors.
+                    _ => unsafe { core::hint::unreachable_unchecked() },
+                },
+            }
         } else {
             Self {
                 ptr: self.ptr,
@@ -1912,12 +1896,30 @@ impl PartialOrd<GStr> for &'_ String {
 }
 
 impl From<char> for GStr {
+    /// Converts a [`char`] into a [`GStr`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// assert_eq!(GStr::from('a'), "a");
+    /// ```
     #[inline]
     fn from(c: char) -> Self {
         let mut buf = [0u8; 4];
         let s = c.encode_utf8(&mut buf);
 
-        Self::new(s)
+        match Self::try_new(s) {
+            Ok(s) => s,
+            Err(e) => match e.kind {
+                ErrorKind::AllocationFailure => handle_alloc_error(e.as_str()),
+                // SAFETY:
+                // - The max length of a single UTF-8 character is 4.
+                // - `GStr::try_new` doesn't return other errors.
+                _ => unsafe { core::hint::unreachable_unchecked() },
+            },
+        }
     }
 }
 
@@ -1931,7 +1933,7 @@ impl From<&GStr> for GStr {
 impl<'a> TryFrom<&'a str> for GStr {
     type Error = ToGStrError<&'a str>;
 
-    /// Converts `&str` into [`GStr`].
+    /// Converts a `&str` into a [`GStr`].
     ///
     /// This clones the string.
     #[inline]
@@ -1943,7 +1945,7 @@ impl<'a> TryFrom<&'a str> for GStr {
 impl<'a> TryFrom<&'a mut str> for GStr {
     type Error = ToGStrError<&'a mut str>;
 
-    /// Converts `&mut str` into [`GStr`].
+    /// Converts a `&mut str` into a [`GStr`].
     ///
     /// This clones the string.
     #[inline]
@@ -1955,7 +1957,7 @@ impl<'a> TryFrom<&'a mut str> for GStr {
 impl TryFrom<String> for GStr {
     type Error = ToGStrError<String>;
 
-    /// Converts [`String`] into [`GStr`].
+    /// Converts a [`String`] into a [`GStr`].
     ///
     /// This doesn't clone the string but shrinks it's capacity to match its length.
     #[inline]
@@ -1967,7 +1969,7 @@ impl TryFrom<String> for GStr {
 impl<'a> TryFrom<&'a String> for GStr {
     type Error = ToGStrError<&'a String>;
 
-    /// Converts `&String` into [`GStr`].
+    /// Converts a `&String` into a [`GStr`].
     ///
     /// This clones the string.
     #[inline]
@@ -1979,7 +1981,7 @@ impl<'a> TryFrom<&'a String> for GStr {
 impl TryFrom<Box<str>> for GStr {
     type Error = ToGStrError<Box<str>>;
 
-    /// Converts `Box<str>` into [`GStr`].
+    /// Converts a `Box<str>` into a [`GStr`].
     ///
     /// This doesn't clone the string.
     #[inline]
@@ -1993,6 +1995,10 @@ impl TryFrom<Box<str>> for GStr {
 impl<'a> TryFrom<Cow<'a, str>> for GStr {
     type Error = ToGStrError<Cow<'a, str>>;
 
+    /// Converts a `Cow<str>` into a [`GStr`].
+    ///
+    /// If the string is owned, this doesn't clone the string but shrinks it's capacity to match its
+    /// length. Otherwise it clones the string.
     #[inline]
     fn try_from(string: Cow<'a, str>) -> Result<Self, Self::Error> {
         match string {
@@ -2289,6 +2295,7 @@ const _: () = {
 mod tests {
     use super::*;
 
+    use alloc::format;
     #[cfg(any(not(miri), feature = "proptest_miri"))]
     use proptest::prelude::*;
 
@@ -2307,30 +2314,30 @@ mod tests {
         f("hello, 🦀 and 🌎!");
     }
 
-    fn test_gstr_is_eq(a: GStr, b: &str) {
+    fn test_gstr_is_eq(a: &GStr, b: &str) {
         assert_eq!(a.len(), b.len());
         assert_eq!(a, b);
         assert_eq!(b, a);
-        assert_eq!(a.cmp(&a), Ordering::Equal);
-        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(a.cmp(a), Ordering::Equal);
+        assert_eq!(a.partial_cmp(a), Some(Ordering::Equal));
         assert_eq!(a.partial_cmp(b), Some(Ordering::Equal));
-        assert_eq!(b.partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(b.partial_cmp(a), Some(Ordering::Equal));
 
         let c = GStr::new(b);
         assert_eq!(a.len(), c.len());
-        assert_eq!(a, c);
+        assert_eq!(a, &c);
         assert_eq!(c, a);
         assert_eq!(a.cmp(&c), Ordering::Equal);
-        assert_eq!(c.cmp(&a), Ordering::Equal);
+        assert_eq!(c.cmp(a), Ordering::Equal);
         assert_eq!(a.partial_cmp(&c), Some(Ordering::Equal));
         assert_eq!(c.partial_cmp(&a), Some(Ordering::Equal));
 
         let d = a.clone();
         assert_eq!(a.len(), d.len());
-        assert_eq!(a, d);
+        assert_eq!(a, &d);
         assert_eq!(d, a);
         assert_eq!(a.cmp(&d), Ordering::Equal);
-        assert_eq!(d.cmp(&a), Ordering::Equal);
+        assert_eq!(d.cmp(a), Ordering::Equal);
         assert_eq!(a.partial_cmp(&d), Some(Ordering::Equal));
         assert_eq!(d.partial_cmp(&a), Some(Ordering::Equal));
 
@@ -2344,27 +2351,98 @@ mod tests {
         }
     }
 
+    fn test_gstr_concat(gstr: &GStr, string: &str) {
+        assert_eq!(gstr.concat(""), gstr);
+        assert_eq!(gstr.concat("foo"), format!("{}{}", gstr, "foo"));
+        assert_eq!(gstr.concat(string), format!("{}{}", gstr, string));
+    }
+
+    fn test_gstr_raw_parts(gstr: GStr, string: &str) {
+        let ptr = gstr.as_ptr();
+        let is_static = gstr.is_static();
+        let (buf, len) = gstr.into_raw_parts();
+        if is_static {
+            assert!(matches!(buf, RawBuffer::Static(_)));
+        } else {
+            assert!(matches!(buf, RawBuffer::Heap(_)));
+        }
+        if string.is_empty() {
+            assert!(matches!(buf, RawBuffer::Static(_)));
+        }
+        assert_eq!(buf.as_ptr(), ptr);
+        assert_eq!(len, string.len());
+
+        // SAFETY: `buf` and `len` are from `GStr::into_raw_parts`.
+        let gstr = unsafe { GStr::from_raw_parts(buf, len) };
+        assert_eq!(gstr, string);
+        assert_eq!(gstr.as_ptr(), ptr);
+        assert_eq!(gstr.len(), len);
+        assert_eq!(gstr.is_static(), is_static);
+        assert_eq!(gstr.is_heap(), !is_static);
+        if string.is_empty() {
+            assert!(gstr.is_static());
+        }
+    }
+
+    fn test_gstr_into_string(gstr: GStr, string: &str) {
+        let is_heap = gstr.is_heap();
+        let gstr_clone = gstr.clone();
+        let ptr = gstr_clone.as_ptr();
+        let s = gstr_clone.into_string();
+        if is_heap {
+            assert_eq!(s.as_ptr(), ptr);
+        }
+        assert_eq!(s, string);
+        assert_eq!(s.len(), string.len());
+
+        let gstr_clone = gstr.clone();
+        let ptr = gstr_clone.as_ptr();
+        let boxed_str = gstr_clone.into_boxed_str();
+        if is_heap {
+            assert_eq!(boxed_str.as_ptr(), ptr);
+        }
+        assert_eq!(boxed_str.as_ref(), string);
+        assert_eq!(boxed_str.len(), string.len());
+
+        let ptr = gstr.as_ptr();
+        let bytes = gstr.into_bytes();
+        if is_heap {
+            assert_eq!(bytes.as_ptr(), ptr);
+        }
+        assert_eq!(bytes, string.as_bytes());
+        assert_eq!(bytes.len(), string.len());
+    }
+
     fn test_gstr_new(string: &str) {
         let gstr = GStr::new(string);
 
         if gstr.is_empty() {
             assert!(gstr.is_static());
             assert!(!gstr.is_heap());
+            assert_eq!(gstr.as_static_str(), Some(""));
         } else {
             assert!(gstr.is_heap());
             assert!(!gstr.is_static());
+            assert_eq!(gstr.as_static_str(), None);
         }
 
-        test_gstr_is_eq(gstr, string);
+        test_gstr_is_eq(&gstr, string);
+        test_gstr_concat(&gstr, string);
+        test_gstr_raw_parts(gstr.clone(), string);
+        test_gstr_into_string(gstr, string);
     }
 
-    fn test_gstr_const_new(string: &'static str) {
+    fn test_gstr_from_static(string: &'static str) {
         let gstr = GStr::from_static(string);
 
         assert!(gstr.is_static());
         assert!(!gstr.is_heap());
+        assert_eq!(gstr.as_static_str(), Some(string));
 
-        test_gstr_is_eq(gstr, string);
+        test_gstr_is_eq(&gstr, string);
+        test_gstr_concat(&gstr, string);
+        test_gstr_raw_parts(gstr.clone(), string);
+        test_gstr_into_string(gstr, string);
     }
 
     fn test_gstr_from_string(string: &str) {
@@ -2373,12 +2451,17 @@ mod tests {
         if gstr.is_empty() {
             assert!(gstr.is_static());
             assert!(!gstr.is_heap());
+            assert_eq!(gstr.as_static_str(), Some(""));
         } else {
             assert!(gstr.is_heap());
             assert!(!gstr.is_static());
+            assert_eq!(gstr.as_static_str(), None);
         }
 
-        test_gstr_is_eq(gstr, string);
+        test_gstr_is_eq(&gstr, string);
+        test_gstr_concat(&gstr, string);
+        test_gstr_raw_parts(gstr.clone(), string);
+        test_gstr_into_string(gstr, string);
 
         let mut s = String::from(string);
         s.reserve(16);
@@ -2387,12 +2470,17 @@ mod tests {
         if gstr.is_empty() {
             assert!(gstr.is_static());
             assert!(!gstr.is_heap());
+            assert_eq!(gstr.as_static_str(), Some(""));
         } else {
             assert!(gstr.is_heap());
             assert!(!gstr.is_static());
+            assert_eq!(gstr.as_static_str(), None);
         }
 
-        test_gstr_is_eq(gstr, string);
+        test_gstr_is_eq(&gstr, string);
+        test_gstr_concat(&gstr, string);
+        test_gstr_raw_parts(gstr.clone(), string);
+        test_gstr_into_string(gstr, string);
     }
 
     fn test_gstr_eq_cmp(a: &str, b: &str) {
@@ -2454,7 +2542,9 @@ mod tests {
             let gstr = unsafe { GStr::from_utf8_unchecked(bytes.clone()) };
             assert_eq!(gstr, string);
         } else {
-            assert!(gstr.is_err());
+            let err = gstr.unwrap_err();
+            assert!(matches!(err.error_kind(), ErrorKind::Utf8Error(_)));
+            assert_eq!(err.into_source(), bytes);
         }
 
         let gstr = GStr::from_utf8_lossy(bytes.clone());
@@ -2497,7 +2587,9 @@ mod tests {
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
         } else {
-            assert!(gstr.is_err());
+            let err = gstr.unwrap_err();
+            assert!(matches!(err.error_kind(), ErrorKind::InvalidUtf16));
+            assert_eq!(err.into_source(), &bytes);
         }
 
         let gstr = GStr::from_utf16_lossy(&bytes);
@@ -2505,14 +2597,19 @@ mod tests {
         assert_eq!(gstr, string);
     }
 
-    #[cfg(any(feature = "nightly_test", feature = "proptest_miri"))]
+    #[cfg(feature = "nightly_test")]
     fn test_gstr_utf16_u8_bytes(bytes: Vec<u8>) {
         let string = String::from_utf16le(&bytes);
         let gstr = GStr::from_utf16le(&bytes);
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
         } else {
-            assert!(gstr.is_err());
+            let err = gstr.unwrap_err();
+            assert!(matches!(
+                err.error_kind(),
+                ErrorKind::InvalidUtf16 | ErrorKind::FromUtf16OddLength
+            ));
+            assert_eq!(err.into_source(), &bytes);
         }
 
         let string = String::from_utf16le_lossy(&bytes);
@@ -2524,7 +2621,12 @@ mod tests {
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
         } else {
-            assert!(gstr.is_err());
+            let err = gstr.unwrap_err();
+            assert!(matches!(
+                err.error_kind(),
+                ErrorKind::InvalidUtf16 | ErrorKind::FromUtf16OddLength
+            ));
+            assert_eq!(err.into_source(), &bytes);
         }
 
         let string = String::from_utf16be_lossy(&bytes);
@@ -2539,7 +2641,7 @@ mod tests {
 
     #[test]
     fn gstr_from_static() {
-        test_literal_strings(test_gstr_const_new);
+        test_literal_strings(test_gstr_from_static);
     }
 
     #[test]
@@ -2566,6 +2668,22 @@ mod tests {
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
+    fn string_to_static<F: FnOnce(&'static str)>(string: String, f: F) {
+        let len = string.len();
+        let capacity = string.capacity();
+        let string = string.leak();
+        let ptr = string.as_mut_ptr();
+
+        f(string);
+
+        // To avoid memory leaks.
+        // SAFETY: `ptr`, `len` and `capacity` are from the original string.
+        unsafe {
+            drop(String::from_raw_parts(ptr, len, capacity));
+        }
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
     proptest! {
         #[test]
         fn prop_gstr_new(string: String) {
@@ -2577,18 +2695,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_from_static(string: String) {
-            let len = string.len();
-            let capacity = string.capacity();
-            let string = string.leak();
-            let ptr = string.as_mut_ptr();
-
-            test_gstr_const_new(string);
-
-            // To avoid memory leaks.
-            // SAFETY: `GStr` doesn't drop its inner string buffer if it's created by `const_new`.
-            unsafe {
-                drop(String::from_raw_parts(ptr, len, capacity));
-            }
+            string_to_static(string, test_gstr_from_static);
         }
     }
 
@@ -2640,7 +2747,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "nightly_test", feature = "proptest_miri"))]
+    #[cfg(feature = "nightly_test")]
     proptest! {
         #[test]
         fn prop_gstr_utf16_u8_bytes(bytes: Vec<u8>) {

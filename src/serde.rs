@@ -77,7 +77,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
             length_overflow(v.len())
         } else {
             match core::str::from_utf8(v) {
-                Ok(s) => Ok(GStr::new(s)),
+                Ok(s) => self.visit_str(s),
                 Err(_) => Err(Error::invalid_value(Unexpected::Bytes(v), &self)),
             }
         }
@@ -111,3 +111,6 @@ fn length_overflow<E: Error>(len: usize) -> Result<GStr, E> {
         len
     )))
 }
+
+#[cfg(test)]
+mod tests {}

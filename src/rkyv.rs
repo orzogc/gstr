@@ -37,7 +37,7 @@ where
 {
     #[inline]
     fn deserialize(&self, _deserializer: &mut D) -> Result<GStr, <D as Fallible>::Error> {
-        // TODO: Avoid panic when the string's length is too large.
+        // TODO: Avoid panic if the string's length is too large?
         Ok(GStr::new(self.as_str()))
     }
 }
@@ -45,28 +45,28 @@ where
 impl PartialEq<ArchivedString> for GStr {
     #[inline]
     fn eq(&self, other: &ArchivedString) -> bool {
-        self.as_str() == other.as_str()
+        self == other.as_str()
     }
 }
 
 impl PartialEq<GStr> for ArchivedString {
     #[inline]
     fn eq(&self, other: &GStr) -> bool {
-        self.as_str() == other.as_str()
+        self.as_str() == other
     }
 }
 
 impl PartialOrd<ArchivedString> for GStr {
     #[inline]
     fn partial_cmp(&self, other: &ArchivedString) -> Option<Ordering> {
-        self.as_str().partial_cmp(other.as_str())
+        self.partial_cmp(other.as_str())
     }
 }
 
 impl PartialOrd<GStr> for ArchivedString {
     #[inline]
     fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
-        self.as_str().partial_cmp(other.as_str())
+        self.as_str().partial_cmp(other)
     }
 }
 
