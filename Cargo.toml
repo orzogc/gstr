@@ -1,16 +1,22 @@
 [package]
 name = "gstr"
+description = "An immutable string optimized for small strings and comparison."
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["orzogc <orzogc@163.com>"]
 license = "MIT OR Apache-2.0"
+homepage = "https://github.com/orzogc/gstr"
+repository = "https://github.com/orzogc/gstr"
+readme = "README.md"
+keywords = ["string", "immutable"]
+categories = ["no-std"]
 
 [features]
 default = ["std"]
 # For running tests on nightly Rust.
 nightly_test = []
-# For running proptest in MIRI.
+# For running proptest with MIRI.
 proptest_miri = ["nightly_test"]
 serde = ["dep:serde"]
 rkyv = ["dep:rkyv"]
@@ -41,7 +47,7 @@ name = "comparison"
 harness = false
 
 [lints.rust]
-# missing_docs = "warn"
+missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 
 [lints.clippy]

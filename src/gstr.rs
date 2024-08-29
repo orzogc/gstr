@@ -477,7 +477,7 @@ impl GStr {
 
     /// Creates a [`GStr`] from a string.
     ///
-    /// The string is cloned if it isn't empty.
+    /// The string is cloned if it isn't empty, otherwise [`GStr::EMPTY`] is returned.
     ///
     /// # Errors
     ///
@@ -529,7 +529,7 @@ impl GStr {
 
     /// Creates a [`GStr`] from a string.
     ///
-    /// The string is cloned if it isn't empty.
+    /// The string is cloned if it isn't empty, otherwise [`GStr::EMPTY`] is returned.
     ///
     /// # Panics
     ///
@@ -599,6 +599,8 @@ impl GStr {
     /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
     /// capacity is equal to its length, no reallocation occurs.
     ///
+    /// If the string is empty, [`GStr::EMPTY`] is returned.
+    ///
     /// # Errors
     ///
     /// Returns an [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
@@ -652,6 +654,8 @@ impl GStr {
     ///
     /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
     /// capacity is equal to its length, no reallocation occurs.
+    ///
+    /// If the string is empty, [`GStr::EMPTY`] is returned.
     ///
     /// # Panics
     ///
@@ -929,7 +933,7 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns an [`Err`] if the slice contains any invalid data.
+    /// Returns an [`Err`] if the slice contains any invalid data or the length of the slice is odd.
     ///
     /// # Panics
     ///
@@ -1038,7 +1042,7 @@ impl GStr {
     ///
     /// # Errors
     ///
-    /// Returns an [`Err`] if the slice contains any invalid data.
+    /// Returns an [`Err`] if the slice contains any invalid data or the length of the slice is odd.
     ///
     /// # Panics
     ///
