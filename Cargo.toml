@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["std"]
-# For running tests on nightly.
+# For running tests on nightly Rust.
 nightly_test = []
 # For running proptest in MIRI.
 proptest_miri = ["nightly_test"]
@@ -32,13 +32,16 @@ rkyv = { version = "0.7", default-features = false, features = [
     "alloc",
     "size_32",
 ] }
+serde_json = { version = "1.0.127", default-features = false, features = [
+    "alloc",
+] }
 
 [[bench]]
 name = "comparison"
 harness = false
 
 [lints.rust]
-#missing_docs = "warn"
+# missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 
 [lints.clippy]

@@ -122,6 +122,7 @@ impl<S> ToGStrError<S> {
 }
 
 impl<S: AsRef<str>> ToGStrError<S> {
+    /// Returns the source's string slice.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -1915,7 +1916,7 @@ impl From<char> for GStr {
             Err(e) => match e.kind {
                 ErrorKind::AllocationFailure => handle_alloc_error(e.as_str()),
                 // SAFETY:
-                // - The max length of a single UTF-8 character is 4.
+                // - The max length in bytes of a single UTF-8 character is 4.
                 // - `GStr::try_new` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },

@@ -71,4 +71,51 @@ impl PartialOrd<GStr> for ArchivedString {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    extern crate alloc;
+    use alloc::string::String;
+
+    use proptest::prelude::*;
+
+    fn test_gstr_rkyv(string: String) {
+        let gstr = GStr::new(&string);
+
+        let string_bytes = rkyv::to_bytes::<_, 32>(&string).unwrap();
+        let gstr_bytes = rkyv::to_bytes::<_, 32>(&gstr).unwrap();
+        assert_eq!(&*string_bytes, &*gstr_bytes);
+
+        // SAFETY: The byte slice is serialized from `rkyv::to_bytes`.
+        let archived = unsafe { rkyv::archived_root::<String>(&string_bytes) };
+        let string_de: String = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let gstr_de: GStr = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        assert_eq!(*archived, string);
+        assert_eq!(string_de, string);
+        assert_eq!(gstr_de, string);
+
+        // SAFETY: The byte slice is serialized from `rkyv::to_bytes`.
+        let archived = unsafe { rkyv::archived_root::<GStr>(&gstr_bytes) };
+        let string_de: String = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        let gstr_de: GStr = archived.deserialize(&mut rkyv::Infallible).unwrap();
+        assert_eq!(*archived, string);
+        assert_eq!(string_de, string);
+        assert_eq!(gstr_de, string);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn gstr_rkyv() {
+        test_gstr_rkyv("".into());
+        test_gstr_rkyv("foo".into());
+        test_gstr_rkyv("hello, 🦀 and 🌎!".into());
+    }
+
+    proptest! {
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn prop_gstr_rkyv(string: String) {
+            test_gstr_rkyv(string);
+        }
+    }
+}

@@ -30,6 +30,7 @@ impl<'de> Deserialize<'de> for GStr {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct GStrVisitor;
 
 impl<'de> Visitor<'de> for GStrVisitor {
@@ -113,4 +114,52 @@ fn length_overflow<E: Error>(len: usize) -> Result<GStr, E> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    use proptest::prelude::*;
+
+    #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+    struct StringStruct {
+        a: String,
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+    struct GStrStruct {
+        a: GStr,
+    }
+
+    fn test_gstr_serde(string: String) {
+        let str_json = serde_json::to_string(string.as_str()).unwrap();
+        let gstr: GStr = serde_json::from_str(&str_json).unwrap();
+        assert_eq!(gstr, string);
+
+        let string_struct = StringStruct { a: string };
+        let gstr_struct = GStrStruct { a: gstr };
+
+        let string_json = serde_json::to_string(&string_struct).unwrap();
+        let gstr_json = serde_json::to_string(&gstr_struct).unwrap();
+        assert_eq!(string_json, gstr_json);
+
+        let string_de: StringStruct = serde_json::from_str(&string_json).unwrap();
+        let gstr_de: GStrStruct = serde_json::from_str(&gstr_json).unwrap();
+        assert_eq!(string_de, string_struct);
+        assert_eq!(gstr_de, gstr_struct);
+    }
+
+    #[test]
+    fn gstr_serde() {
+        test_gstr_serde("".into());
+        test_gstr_serde("foo".into());
+        test_gstr_serde("hello, 🦀 and 🌎!".into());
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_serde(string: String) {
+            test_gstr_serde(string);
+        }
+    }
+}
