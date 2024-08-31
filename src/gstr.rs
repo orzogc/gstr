@@ -240,8 +240,8 @@ impl RawBuffer {
 #[cfg(target_pointer_width = "64")]
 /// The prefix buffer and length of a [`GStr`].
 ///
-/// The most significant 32 bits are used to store the prefix buffer. On little endian machines, the
-/// prefix buffer's order is reversed for comparison optimization.
+/// The most significant 32 bits are used to store the prefix buffer. On little endian platforms,
+/// the prefix buffer's order is reversed for comparison optimization.
 ///
 /// The least significant 31 bits are used to store the length of the string buffer.
 ///
@@ -287,7 +287,8 @@ impl PrefixAndLength {
     const unsafe fn new_unchecked(prefix: [u8; Self::PREFIX_LENGTH], len: usize) -> Self {
         debug_assert!(len <= Self::MAX_LENGTH);
 
-        // Reversed the order of the prefix buffer on little endian machines to optimize comparison.
+        // Reversed the order of the prefix buffer on little endian platforms to optimize
+        // comparison.
         #[cfg(target_endian = "little")]
         let array = [len as u32, u32::from_be_bytes(prefix)];
 
@@ -324,7 +325,7 @@ impl PrefixAndLength {
         (self.0 & Self::LENGTH_MASK) as _
     }
 
-    /// Returns the prefix buffer (its order is reversed on little endian machines) and the actual
+    /// Returns the prefix buffer (its order is reversed on little endian platforms) and the actual
     /// length as a [`u64`].
     #[inline]
     const fn as_prefix_len_u64(self) -> u64 {
@@ -348,12 +349,18 @@ impl PrefixAndLength {
     fn prefix_cmp(self, other: Self) -> Ordering {
         (self.0 & Self::PREFIX_MASK).cmp(&(other.0 & Self::PREFIX_MASK))
     }
+
+    /// Returns whether the prefix buffers and lengths of two [`PrefixAndLength`]s are equal.
+    #[inline]
+    const fn prefix_len_eq(self, other: Self) -> bool {
+        self.as_prefix_len_u64() == other.as_prefix_len_u64()
+    }
 }
 
 #[cfg(target_pointer_width = "32")]
 /// The prefix buffer and length of a [`GStr`].
 ///
-/// On little endian machines, the prefix buffer's order is reversed for comparison optimization.
+/// On little endian platforms, the prefix buffer's order is reversed for comparison optimization.
 ///
 /// The most significant bit in `len` is the static flag. If the static flag is 1, then the string
 /// buffer is static.
@@ -422,13 +429,20 @@ impl PrefixAndLength {
     /// Returns the prefix buffer.
     #[inline]
     const fn as_prefix(self) -> [u8; Self::PREFIX_LENGTH] {
-        u32::from_ne_bytes(self.prefix).to_be_bytes()
+        self.prefix_as_u32().to_be_bytes()
     }
 
     /// Returns the actual length.
     #[inline]
     const fn as_len(self) -> usize {
         (self.len & Self::LENGTH_MASK) as _
+    }
+
+    /// Returns the prefix buffer as a [`u32`]. The prefix buffer's order is reversed on little
+    /// endian platforms.
+    #[inline]
+    const fn prefix_as_u32(self) -> u32 {
+        u32::from_ne_bytes(self.prefix)
     }
 
     /// Indicates whether the string buffer is static.
@@ -446,13 +460,13 @@ impl PrefixAndLength {
     /// Returns whether the prefix buffers of two [`PrefixAndLength`]s is equal.
     #[inline]
     const fn prefix_eq(self, other: Self) -> bool {
-        u32::from_ne_bytes(self.prefix) == u32::from_ne_bytes(other.prefix)
+        self.prefix_as_u32() == other.prefix_as_u32()
     }
 
     /// Compares the prefix buffers of two [`PrefixAndLength`]s.
     #[inline]
     fn prefix_cmp(self, other: Self) -> Ordering {
-        u32::from_ne_bytes(self.prefix).cmp(&u32::from_ne_bytes(other.prefix))
+        self.prefix_as_u32().cmp(&other.prefix_as_u32())
     }
 }
 
@@ -497,7 +511,7 @@ impl GStr {
         let len = s.len();
 
         if len == 0 {
-            Ok(Self::EMPTY)
+            Ok(empty_gstr())
         } else if len <= Self::MAX_LENGTH {
             // SAFETY:
             // - The layout of `s` is valid.
@@ -622,7 +636,7 @@ impl GStr {
         let len = string.len();
 
         if len == 0 {
-            Ok(GStr::EMPTY)
+            Ok(empty_gstr())
         } else if len <= Self::MAX_LENGTH {
             // SAFETY: `string` isn't empty.
             match unsafe { shrink_and_leak_string(string) } {
@@ -810,6 +824,7 @@ impl GStr {
     /// assert_eq!(string, "💖");
     /// ```
     #[inline]
+    #[must_use]
     pub unsafe fn from_utf8_unchecked(bytes: Vec<u8>) -> Self {
         // SAFETY: `bytes` is guranteed to be a valid UTF-8 sequence.
         unsafe { Self::from_string(String::from_utf8_unchecked(bytes)) }
@@ -856,7 +871,7 @@ impl GStr {
 
             valid
         } else {
-            return Self::EMPTY;
+            return empty_gstr();
         };
 
         let mut res = String::with_capacity(bytes.len());
@@ -925,6 +940,7 @@ impl GStr {
     /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834];
     /// assert_eq!(GStr::from_utf16_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
     /// ```
+    #[must_use]
     pub fn from_utf16_lossy<B: AsRef<[u16]>>(bytes: B) -> Self {
         Self::from_string(String::from_utf16_lossy(bytes.as_ref()))
     }
@@ -1008,6 +1024,7 @@ impl GStr {
     ///           0x34, 0xD8];
     /// assert_eq!(GStr::from_utf16le_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
     /// ```
+    #[must_use]
     pub fn from_utf16le_lossy<B: AsRef<[u8]>>(bytes: B) -> Self {
         let b = bytes.as_ref();
 
@@ -1115,6 +1132,7 @@ impl GStr {
     ///           0xD8, 0x34];
     /// assert_eq!(GStr::from_utf16be_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
     /// ```
+    #[must_use]
     pub fn from_utf16be_lossy<B: AsRef<[u8]>>(bytes: B) -> Self {
         let b = bytes.as_ref();
 
@@ -1187,7 +1205,7 @@ impl GStr {
 
     /// Returns whether the string buffer of this [`GStr`] is static.
     ///
-    /// If a [`GStr`] is empty, it is static.
+    /// If a [`GStr`] is empty, it's string buffer must be static.
     ///
     /// # Examples
     ///
@@ -1208,6 +1226,8 @@ impl GStr {
 
     /// Returns whether the string buffer of this [`GStr`] is heap-allocated.
     ///
+    /// If a [`GStr`] is empty, it's string buffer can't be heap-allocated.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1223,14 +1243,6 @@ impl GStr {
     #[must_use]
     pub const fn is_heap(&self) -> bool {
         self.prefix_and_len.is_heap()
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    /// Returns the prefix buffer (its order is reversed on little endian machines) and the actual
-    /// length as a [`u64`].
-    #[inline]
-    const fn as_prefix_len_u64(&self) -> u64 {
-        self.prefix_and_len.as_prefix_len_u64()
     }
 
     /// Returns a raw pointer of the string buffer. If the string buffer isn't empty, the raw
@@ -1369,14 +1381,21 @@ impl GStr {
             // - The whole memory is a valid UTF-8 sequence.
             // - The ownership of the memory is transferred to the returned `String`.
             unsafe { Ok(String::from_raw_parts(string.as_mut_ptr(), len, len)) }
-        } else if len > 0 {
+        } else if len == 0 {
+            /// Returns the empty string.
+            #[cold]
+            fn return_empty_string() -> Result<String, GStr> {
+                Ok(String::new())
+            }
+
+            return_empty_string()
+        } else {
             // SAFETY: The layout of the string buffer is valid and its size is greater than 0.
             let ptr = unsafe { alloc::alloc::alloc(Layout::array::<u8>(len).unwrap_unchecked()) };
 
             if ptr.is_null() {
                 /// Returns the original [`GStr`].
                 #[cold]
-                #[inline(never)]
                 fn return_gstr(string: ManuallyDrop<GStr>) -> Result<String, GStr> {
                     Err(ManuallyDrop::into_inner(string))
                 }
@@ -1395,8 +1414,6 @@ impl GStr {
                 // - The ownership of the memory is transferred to the returned `String`.
                 unsafe { Ok(String::from_raw_parts(ptr, len, len)) }
             }
-        } else {
-            Ok(String::new())
         }
     }
 
@@ -1545,6 +1562,13 @@ impl GStr {
         self.prefix_and_len.prefix_cmp(other.prefix_and_len)
     }
 
+    #[cfg(target_pointer_width = "64")]
+    /// Returns whether the prefix buffers and lengths of two [`GStr`]s are equal.
+    #[inline]
+    const fn prefix_len_eq(&self, other: &GStr) -> bool {
+        self.prefix_and_len.prefix_len_eq(other.prefix_and_len)
+    }
+
     /// Concatenates two strings to a new [`GStr`].
     ///
     /// # Panics
@@ -1665,7 +1689,7 @@ impl Clone for GStr {
             match Self::try_new(self) {
                 Ok(s) => s,
                 Err(e) => match e.kind {
-                    ErrorKind::AllocationFailure => handle_alloc_error(e.as_str()),
+                    ErrorKind::AllocationFailure => handle_alloc_error(e),
                     // SAFETY:
                     // - A `GStr`'s length isn't greater than `GStr::MAX_LENGTH`.
                     // - `GStr::try_new` doesn't return other errors.
@@ -1693,7 +1717,7 @@ impl PartialEq for GStr {
     fn eq(&self, other: &Self) -> bool {
         #[cfg(target_pointer_width = "64")]
         // Test if this two strings's lengths and the prefix buffers are equal at the same time.
-        if self.as_prefix_len_u64() == other.as_prefix_len_u64() {
+        if self.prefix_len_eq(other) {
             debug_assert_eq!(self.len(), other.len());
             debug_assert_eq!(self.prefix(), other.prefix());
 
@@ -1709,6 +1733,7 @@ impl PartialEq for GStr {
         }
 
         #[cfg(target_pointer_width = "32")]
+        // Test if this two strings's lengths and the prefix buffers are equal.
         if self.len() == other.len() && self.prefix_eq(other) {
             debug_assert_eq!(self.len(), other.len());
             debug_assert_eq!(self.prefix(), other.prefix());
@@ -1918,7 +1943,7 @@ impl From<char> for GStr {
         match Self::try_new(s) {
             Ok(s) => s,
             Err(e) => match e.kind {
-                ErrorKind::AllocationFailure => handle_alloc_error(e.as_str()),
+                ErrorKind::AllocationFailure => handle_alloc_error(e),
                 // SAFETY:
                 // - The max length in bytes of a single UTF-8 character is 4.
                 // - `GStr::try_new` doesn't return other errors.
@@ -2235,6 +2260,12 @@ unsafe fn shrink_and_leak_string(string: String) -> Result<&'static mut str, Str
     }
 }
 
+/// Returns an empty [`GStr`].
+#[cold]
+const fn empty_gstr() -> GStr {
+    GStr::EMPTY
+}
+
 /// Returns an allocation failure error.
 #[cold]
 #[inline(never)]
@@ -2393,12 +2424,13 @@ mod tests {
         let is_heap = gstr.is_heap();
         let gstr_clone = gstr.clone();
         let ptr = gstr_clone.as_ptr();
-        let s = gstr_clone.into_string();
+        let mut s = gstr_clone.into_string();
         if is_heap {
             assert_eq!(s.as_ptr(), ptr);
         }
         assert_eq!(s, string);
         assert_eq!(s.len(), string.len());
+        s.push('a');
 
         let gstr_clone = gstr.clone();
         let ptr = gstr_clone.as_ptr();
@@ -2410,12 +2442,13 @@ mod tests {
         assert_eq!(boxed_str.len(), string.len());
 
         let ptr = gstr.as_ptr();
-        let bytes = gstr.into_bytes();
+        let mut bytes = gstr.into_bytes();
         if is_heap {
             assert_eq!(bytes.as_ptr(), ptr);
         }
         assert_eq!(bytes, string.as_bytes());
         assert_eq!(bytes.len(), string.len());
+        bytes.push(0);
     }
 
     fn test_gstr_new(string: &str) {

@@ -1,4 +1,4 @@
-# GStr
+# gstr
 
 `GStr` is an immutable string optimized for small strings and comparison.
 
@@ -28,10 +28,14 @@ assert_eq!(gstr, "Hello, 🦀 and 🌎!");
 
 ## Features
 
-`GStr` supports `no_std`, but needs the [`alloc`](https://doc.rust-lang.org/alloc/index.html) crate to work.
+`gstr` supports `no_std`, but needs the [`alloc`](https://doc.rust-lang.org/alloc/index.html) crate to work.
 
-`GStr` has the following features:
+`gstr` has the following features:
 
 - `std`: Enable support for some types in [`std`](https://doc.rust-lang.org/std/index.html). It's enable by default.
 - `serde`: Enable serialization and deserialization support for [`serde`](https://crates.io/crates/serde).
 - `rkyv`: Enable serialization and deserialization support for [`rkyv`](https://crates.io/crates/rkyv).
+
+## Warnings
+
+`gstr` is not tested on big endian platforms, but it maybe works fine on them.
