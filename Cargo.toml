@@ -1,6 +1,6 @@
 [package]
 name = "gstr"
-description = "An immutable string optimized for small strings and comparison."
+description = "An immutable string implementation optimized for small strings and comparison."
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
@@ -38,12 +38,12 @@ rkyv = { version = "0.7", default-features = false, features = [
     "alloc",
     "size_32",
 ] }
-serde_json = { version = "1.0.127", default-features = false, features = [
+serde_json = { version = "1.0.128", default-features = false, features = [
     "alloc",
 ] }
 
 [[bench]]
-name = "comparison"
+name = "compare_with_string"
 harness = false
 
 [lints.rust]
@@ -62,3 +62,7 @@ ref_as_ptr = "warn"
 semicolon_if_nothing_returned = "warn"
 undocumented_unsafe_blocks = "warn"
 unwrap_or_default = "warn"
+
+[package.metadata.docs.rs]
+features = ["serde", "rkyv"]
+rustdoc-args = ["--generate-link-to-definition"]

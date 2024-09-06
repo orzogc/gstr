@@ -107,7 +107,7 @@ fn random_string_equality(c: &mut Criterion) {
     });
 
     group.bench_with_input(
-        BenchmarkId::new("Gstr and String", ""),
+        BenchmarkId::new("GStr and String", ""),
         &(gstrs, strings),
         |b, (gstrs, strings)| {
             b.iter(|| {
@@ -147,7 +147,7 @@ fn fixed_length_random_string_equality(c: &mut Criterion) {
     });
 
     group.bench_with_input(
-        BenchmarkId::new("Gstr and String", ""),
+        BenchmarkId::new("GStr and String", ""),
         &(gstrs, strings),
         |b, (gstrs, strings)| {
             b.iter(|| {
@@ -187,7 +187,7 @@ fn random_string_comparison(c: &mut Criterion) {
     });
 
     group.bench_with_input(
-        BenchmarkId::new("Gstr and String", ""),
+        BenchmarkId::new("GStr and String", ""),
         &(gstrs, strings),
         |b, (gstrs, strings)| {
             b.iter(|| {

@@ -1,8 +1,8 @@
 # gstr
 
-`GStr` is an immutable string optimized for small strings and comparison.
+`GStr` is an immutable string implementation optimized for small strings and comparison.
 
-The size of `GStr` and `Option<GStr>` is guaranteed to be 16 bytes on 64-bit platforms or 12 bytes on 32-bit platforms.
+The size of `GStr` or `Option<GStr>` is guaranteed to be 16 bytes on 64-bit platforms or 12 bytes on 32-bit platforms.
 
 The first 4 bytes of the string buffer are inlined in `GStr`, so comparing two `GStr`s is faster than comparing two [`str`](https://doc.rust-lang.org/core/primitive.str.html)s in most cases.
 

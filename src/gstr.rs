@@ -350,7 +350,7 @@ impl PrefixAndLength {
         (self.0 & Self::PREFIX_MASK).cmp(&(other.0 & Self::PREFIX_MASK))
     }
 
-    /// Returns whether the prefix buffers and lengths of two [`PrefixAndLength`]s are equal.
+    /// Returns whether the prefix buffers and the lengths of two [`PrefixAndLength`]s are equal.
     #[inline]
     const fn prefix_len_eq(self, other: Self) -> bool {
         self.as_prefix_len_u64() == other.as_prefix_len_u64()
@@ -364,17 +364,12 @@ impl PrefixAndLength {
 ///
 /// The most significant bit in `len` is the static flag. If the static flag is 1, then the string
 /// buffer is static.
-#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct PrefixAndLength {
-    #[cfg(target_endian = "little")]
     /// The length of the string buffer.
     len: u32,
     /// The prefix buffer.
     prefix: [u8; Self::PREFIX_LENGTH],
-    #[cfg(target_endian = "big")]
-    /// The length of the string buffer.
-    len: u32,
 }
 
 #[cfg(target_pointer_width = "32")]
@@ -468,9 +463,15 @@ impl PrefixAndLength {
     fn prefix_cmp(self, other: Self) -> Ordering {
         self.prefix_as_u32().cmp(&other.prefix_as_u32())
     }
+
+    /// Returns whether the prefix buffers and the lengths of two [`PrefixAndLength`]s are equal.
+    #[inline]
+    const fn prefix_len_eq(self, other: Self) -> bool {
+        self.as_len() == other.as_len() && self.prefix_eq(other)
+    }
 }
 
-/// An immutable string optimized for small strings and comparison.
+/// An immutable string implementation optimized for small strings and comparison.
 // NOTE: If the string buffer is heap allocated, it can't be empty.
 pub struct GStr {
     /// The pointer which points to the string buffer.
@@ -1549,21 +1550,13 @@ impl GStr {
         (buf, len)
     }
 
-    #[cfg(target_pointer_width = "32")]
-    /// Returns whether the prefix buffers is equal.
-    #[inline]
-    const fn prefix_eq(&self, other: &Self) -> bool {
-        self.prefix_and_len.prefix_eq(other.prefix_and_len)
-    }
-
     /// Compares the prefix buffers.
     #[inline]
     fn prefix_cmp(&self, other: &Self) -> Ordering {
         self.prefix_and_len.prefix_cmp(other.prefix_and_len)
     }
 
-    #[cfg(target_pointer_width = "64")]
-    /// Returns whether the prefix buffers and lengths of two [`GStr`]s are equal.
+    /// Returns whether the prefix buffers and the lengths of two [`GStr`]s are equal.
     #[inline]
     const fn prefix_len_eq(&self, other: &GStr) -> bool {
         self.prefix_and_len.prefix_len_eq(other.prefix_and_len)
@@ -1715,26 +1708,8 @@ impl Default for GStr {
 impl PartialEq for GStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        #[cfg(target_pointer_width = "64")]
-        // Test if this two strings's lengths and the prefix buffers are equal at the same time.
+        // Test if this two strings's lengths and prefix buffers are equal.
         if self.prefix_len_eq(other) {
-            debug_assert_eq!(self.len(), other.len());
-            debug_assert_eq!(self.prefix(), other.prefix());
-
-            let len = self.len();
-            // SAFETY: The length of `self`'s string buffer is `len`.
-            let a = unsafe { slice::from_raw_parts(self.as_ptr(), len) };
-            // SAFETY: The length of `other`'s string buffer is `len`.
-            let b = unsafe { slice::from_raw_parts(other.as_ptr(), len) };
-
-            a == b
-        } else {
-            false
-        }
-
-        #[cfg(target_pointer_width = "32")]
-        // Test if this two strings's lengths and the prefix buffers are equal.
-        if self.len() == other.len() && self.prefix_eq(other) {
             debug_assert_eq!(self.len(), other.len());
             debug_assert_eq!(self.prefix(), other.prefix());
 
@@ -2294,11 +2269,10 @@ pub(crate) fn handle_alloc_error<B: AsRef<[u8]>>(buf: B) -> ! {
 
 const _: () = {
     assert!(size_of::<PrefixAndLength>() == size_of::<u64>());
+    assert!(align_of::<PrefixAndLength>() == align_of::<usize>());
 
     #[cfg(target_pointer_width = "64")]
     {
-        assert!(align_of::<PrefixAndLength>() == align_of::<u64>());
-
         assert!(size_of::<GStr>() == 4 * size_of::<u32>());
         assert!(size_of::<Option<GStr>>() == 4 * size_of::<u32>());
 
@@ -2309,8 +2283,6 @@ const _: () = {
 
     #[cfg(target_pointer_width = "32")]
     {
-        assert!(align_of::<PrefixAndLength>() == align_of::<u32>());
-
         assert!(size_of::<GStr>() == 3 * size_of::<u32>());
         assert!(size_of::<Option<GStr>>() == 3 * size_of::<u32>());
     }
