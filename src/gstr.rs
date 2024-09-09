@@ -368,8 +368,8 @@ impl PrefixAndLength {
 struct PrefixAndLength {
     /// The length of the string buffer.
     len: u32,
-    /// The prefix buffer.
-    prefix: [u8; Self::PREFIX_LENGTH],
+    /// The prefix buffer represented as an [`u32`].
+    prefix: u32,
 }
 
 #[cfg(target_pointer_width = "32")]
@@ -401,7 +401,7 @@ impl PrefixAndLength {
 
         Self {
             len: len as _,
-            prefix: u32::from_be_bytes(prefix).to_ne_bytes(),
+            prefix: u32::from_be_bytes(prefix),
         }
     }
 
@@ -417,27 +417,20 @@ impl PrefixAndLength {
 
         Self {
             len: len as u32 | Self::STATIC_MASK,
-            prefix: u32::from_be_bytes(prefix).to_ne_bytes(),
+            prefix: u32::from_be_bytes(prefix),
         }
     }
 
     /// Returns the prefix buffer.
     #[inline]
     const fn as_prefix(self) -> [u8; Self::PREFIX_LENGTH] {
-        self.prefix_as_u32().to_be_bytes()
+        self.prefix.to_be_bytes()
     }
 
     /// Returns the actual length.
     #[inline]
     const fn as_len(self) -> usize {
         (self.len & Self::LENGTH_MASK) as _
-    }
-
-    /// Returns the prefix buffer as a [`u32`]. The prefix buffer's order is reversed on little
-    /// endian platforms.
-    #[inline]
-    const fn prefix_as_u32(self) -> u32 {
-        u32::from_ne_bytes(self.prefix)
     }
 
     /// Indicates whether the string buffer is static.
@@ -455,13 +448,13 @@ impl PrefixAndLength {
     /// Returns whether the prefix buffers of two [`PrefixAndLength`]s is equal.
     #[inline]
     const fn prefix_eq(self, other: Self) -> bool {
-        self.prefix_as_u32() == other.prefix_as_u32()
+        self.prefix == other.prefix
     }
 
     /// Compares the prefix buffers of two [`PrefixAndLength`]s.
     #[inline]
     fn prefix_cmp(self, other: Self) -> Ordering {
-        self.prefix_as_u32().cmp(&other.prefix_as_u32())
+        self.prefix.cmp(&other.prefix)
     }
 
     /// Returns whether the prefix buffers and the lengths of two [`PrefixAndLength`]s are equal.
@@ -2339,6 +2332,8 @@ mod tests {
         assert_eq!(c.cmp(a), Ordering::Equal);
         assert_eq!(a.partial_cmp(&c), Some(Ordering::Equal));
         assert_eq!(c.partial_cmp(&a), Some(Ordering::Equal));
+        assert!(a.prefix_len_eq(&c));
+        assert!(c.prefix_len_eq(a));
 
         let d = a.clone();
         assert_eq!(a.len(), d.len());
@@ -2348,6 +2343,8 @@ mod tests {
         assert_eq!(d.cmp(a), Ordering::Equal);
         assert_eq!(a.partial_cmp(&d), Some(Ordering::Equal));
         assert_eq!(d.partial_cmp(&a), Some(Ordering::Equal));
+        assert!(a.prefix_len_eq(&d));
+        assert!(d.prefix_len_eq(a));
 
         let bytes = b.as_bytes();
         #[allow(clippy::needless_range_loop)]
@@ -2526,6 +2523,26 @@ mod tests {
         assert_eq!(gstr_b >= a, b >= gstr_a);
         assert_eq!(gstr_b <= a, b <= gstr_a);
         assert_eq!(gstr_b.partial_cmp(a), b.partial_cmp(&gstr_a));
+
+        match a.as_bytes()[..a.len().min(PrefixAndLength::PREFIX_LENGTH)]
+            .cmp(&b.as_bytes()[..b.len().min(PrefixAndLength::PREFIX_LENGTH)])
+        {
+            Ordering::Less => {
+                assert_eq!(gstr_a.prefix_cmp(&gstr_b), Ordering::Less);
+                assert_eq!(gstr_b.prefix_cmp(&gstr_a), Ordering::Greater);
+                assert!(!gstr_a.prefix_len_eq(&gstr_b));
+            }
+            Ordering::Equal => {
+                assert_eq!(gstr_a.prefix_cmp(&gstr_b), Ordering::Equal);
+                assert_eq!(gstr_b.prefix_cmp(&gstr_a), Ordering::Equal);
+                assert_eq!(gstr_a.prefix_len_eq(&gstr_b), a.len() == b.len());
+            }
+            Ordering::Greater => {
+                assert_eq!(gstr_a.prefix_cmp(&gstr_b), Ordering::Greater);
+                assert_eq!(gstr_b.prefix_cmp(&gstr_a), Ordering::Less);
+                assert!(!gstr_a.prefix_len_eq(&gstr_b));
+            }
+        }
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
