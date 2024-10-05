@@ -3,11 +3,12 @@
 use core::cmp::Ordering;
 
 use rkyv::{
+    rancor::{Fallible, ResultExt as _, Source},
     string::{ArchivedString, StringResolver},
-    Archive, Deserialize, DeserializeUnsized, Fallible, Serialize, SerializeUnsized,
+    Archive, Deserialize, DeserializeUnsized, Place, Serialize, SerializeUnsized,
 };
 
-use crate::GStr;
+use crate::{gstr::ResultExt as _, GStr};
 
 impl Archive for GStr {
     type Archived = ArchivedString;
@@ -15,14 +16,14 @@ impl Archive for GStr {
     type Resolver = StringResolver;
 
     #[inline]
-    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
-        // SAFETY: It's caller's responsibility to ensure the safety invariants.
-        unsafe { ArchivedString::resolve_from_str(self.as_str(), pos, resolver, out) }
+    fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+        ArchivedString::resolve_from_str(self.as_str(), resolver, out);
     }
 }
 
 impl<S: Fallible + ?Sized> Serialize<S> for GStr
 where
+    S::Error: Source,
     str: SerializeUnsized<S>,
 {
     #[inline]
@@ -33,12 +34,14 @@ where
 
 impl<D: Fallible + ?Sized> Deserialize<GStr, D> for ArchivedString
 where
+    D::Error: Source,
     str: DeserializeUnsized<str, D>,
 {
     #[inline]
     fn deserialize(&self, _deserializer: &mut D) -> Result<GStr, <D as Fallible>::Error> {
-        // TODO: Avoid panic if the string's length is too large?
-        Ok(GStr::new(self.as_str()))
+        GStr::try_new(self.as_str())
+            .map_err_source(|_| {})
+            .into_error()
     }
 }
 
@@ -78,29 +81,30 @@ mod tests {
     use alloc::string::String;
 
     use proptest::prelude::*;
+    use rkyv::rancor::Error;
 
     fn test_gstr_rkyv(string: String) {
         let gstr = GStr::new(&string);
 
-        let string_bytes = rkyv::to_bytes::<_, 32>(&string).unwrap();
-        let gstr_bytes = rkyv::to_bytes::<_, 32>(&gstr).unwrap();
+        let string_bytes = rkyv::to_bytes::<Error>(&string).unwrap();
+        let gstr_bytes = rkyv::to_bytes::<Error>(&gstr).unwrap();
         assert_eq!(&*string_bytes, &*gstr_bytes);
 
-        // SAFETY: The byte slice is serialized from `rkyv::to_bytes`.
-        let archived = unsafe { rkyv::archived_root::<String>(&string_bytes) };
-        let string_de: String = archived.deserialize(&mut rkyv::Infallible).unwrap();
-        let gstr_de: GStr = archived.deserialize(&mut rkyv::Infallible).unwrap();
-        assert_eq!(*archived, string);
-        assert_eq!(string_de, string);
-        assert_eq!(gstr_de, string);
+        // SAFETY: `string_bytes` is serialized from `rkyv::to_bytes`.
+        unsafe {
+            let string_de: String = rkyv::from_bytes_unchecked::<_, Error>(&string_bytes).unwrap();
+            let gstr_de: GStr = rkyv::from_bytes_unchecked::<_, Error>(&string_bytes).unwrap();
+            assert_eq!(string_de, string);
+            assert_eq!(gstr_de, string);
+        }
 
-        // SAFETY: The byte slice is serialized from `rkyv::to_bytes`.
-        let archived = unsafe { rkyv::archived_root::<GStr>(&gstr_bytes) };
-        let string_de: String = archived.deserialize(&mut rkyv::Infallible).unwrap();
-        let gstr_de: GStr = archived.deserialize(&mut rkyv::Infallible).unwrap();
-        assert_eq!(*archived, string);
-        assert_eq!(string_de, string);
-        assert_eq!(gstr_de, string);
+        // SAFETY: `gstr_bytes` is serialized from `rkyv::to_bytes`.
+        unsafe {
+            let string_de: String = rkyv::from_bytes_unchecked::<_, Error>(&gstr_bytes).unwrap();
+            let gstr_de: GStr = rkyv::from_bytes_unchecked::<_, Error>(&gstr_bytes).unwrap();
+            assert_eq!(string_de, string);
+            assert_eq!(gstr_de, string);
+        }
     }
 
     #[cfg_attr(miri, ignore)]

@@ -1,7 +1,7 @@
 [package]
 name = "gstr"
 description = "An immutable string implementation optimized for small strings and comparison."
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["orzogc <orzogc@163.com>"]
@@ -14,7 +14,7 @@ categories = ["no-std"]
 
 [features]
 default = ["std"]
-# For running tests on nightly Rust.
+# For running tests by nightly Rust.
 nightly_test = []
 # For running proptest with MIRI.
 proptest_miri = ["nightly_test"]
@@ -23,9 +23,7 @@ rkyv = ["dep:rkyv"]
 std = []
 
 [dependencies]
-rkyv = { version = "0.7", optional = true, default-features = false, features = [
-    "size_32",
-] }
+rkyv = { version = "0.8", optional = true, default-features = false }
 serde = { version = "1", optional = true, default-features = false, features = [
     "alloc",
 ] }
@@ -34,10 +32,7 @@ serde = { version = "1", optional = true, default-features = false, features = [
 criterion = "0.5.1"
 proptest = { version = "1.5.0", default-features = false, features = ["std"] }
 rand = "0.8.5"
-rkyv = { version = "0.7", default-features = false, features = [
-    "alloc",
-    "size_32",
-] }
+rkyv = { version = "0.8", default-features = false, features = ["alloc"] }
 serde_json = { version = "1.0.128", default-features = false, features = [
     "alloc",
 ] }

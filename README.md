@@ -32,7 +32,7 @@ assert_eq!(gstr, "Hello, 🦀 and 🌎!");
 
 `gstr` has the following features:
 
-- `std`: Enable support for some types in [`std`](https://doc.rust-lang.org/std/index.html). It's enable by default.
+- `std`: Enable support for some types in [`std`](https://doc.rust-lang.org/std/index.html). It's enabled by default.
 - `serde`: Enable serialization and deserialization support for [`serde`](https://crates.io/crates/serde).
 - `rkyv`: Enable serialization and deserialization support for [`rkyv`](https://crates.io/crates/rkyv).
 

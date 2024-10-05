@@ -113,7 +113,7 @@ impl<S> ToGStrError<S> {
 
     /// Converts the source into a new source.
     #[inline]
-    fn map_source<T, F: FnOnce(S) -> T>(self, f: F) -> ToGStrError<T> {
+    pub(crate) fn map_source<T, F: FnOnce(S) -> T>(self, f: F) -> ToGStrError<T> {
         ToGStrError {
             kind: self.kind,
             source: f(self.source),
@@ -195,7 +195,7 @@ impl From<FromUtf8Error> for ToGStrError<Vec<u8>> {
 }
 
 /// A trait extending [`Result`].
-trait ResultExt<S, NS> {
+pub(crate) trait ResultExt<S, NS> {
     /// The result type.
     type Result<T>;
 
