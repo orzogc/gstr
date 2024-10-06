@@ -14,7 +14,7 @@ categories = ["no-std"]
 
 [features]
 default = ["std"]
-# For running tests by nightly Rust.
+# For running tests with nightly Rust.
 nightly_test = []
 # For running proptest with MIRI.
 proptest_miri = ["nightly_test"]

@@ -8,7 +8,7 @@ use rkyv::{
     Archive, Deserialize, DeserializeUnsized, Place, Serialize, SerializeUnsized,
 };
 
-use crate::{gstr::ResultExt as _, GStr};
+use crate::{GStr, ResultExt as _};
 
 impl Archive for GStr {
     type Archived = ArchivedString;

@@ -28,10 +28,12 @@ pub enum ErrorKind {
     /// Indicates that the string's length exceeds the maximum allowed length
     /// ([`GStr::MAX_LENGTH`]).
     ///
-    /// The wrapped `usize` represents the actual length of the string.
+    /// The wrapped [`usize`] represents the actual length of the string.
     LengthOverflow(usize),
     /// Occurs when there is a failure to allocate memory.
-    AllocationFailure,
+    ///
+    /// The wrapped [`Layout`] represents the layout of the memory allocation that failed.
+    AllocationFailure(Layout),
     /// Errors that occur when attempting to interpret a byte sequence as a UTF-8 string.
     ///
     /// The wrapped [`Utf8Error`] is the specific UTF-8 error encountered.
@@ -48,7 +50,8 @@ pub enum ErrorKind {
 pub struct ToGStrError<S> {
     /// The kind of error that occurred.
     kind: ErrorKind,
-    /// The source attempted to be converted to a [`GStr`].
+    /// The source attempted to be converted to a [`GStr`]. It may be a `()` if fails to get the
+    /// source.
     source: S,
 }
 
@@ -64,9 +67,9 @@ impl<S> ToGStrError<S> {
 
     /// Creates a new error indicating that the memory allocation failed.
     #[inline]
-    fn new_allocation_failure(source: S) -> Self {
+    fn new_allocation_failure(source: S, layout: Layout) -> Self {
         Self {
-            kind: ErrorKind::AllocationFailure,
+            kind: ErrorKind::AllocationFailure(layout),
             source,
         }
     }
@@ -113,7 +116,7 @@ impl<S> ToGStrError<S> {
 
     /// Converts the source into a new source.
     #[inline]
-    pub(crate) fn map_source<T, F: FnOnce(S) -> T>(self, f: F) -> ToGStrError<T> {
+    fn map_source<T, F: FnOnce(S) -> T>(self, f: F) -> ToGStrError<T> {
         ToGStrError {
             kind: self.kind,
             source: f(self.source),
@@ -161,7 +164,12 @@ impl<S> fmt::Display for ToGStrError<S> {
                 GStr::MAX_LENGTH,
                 len
             ),
-            ErrorKind::AllocationFailure => write!(f, "failed to allocate memory"),
+            ErrorKind::AllocationFailure(layout) => write!(
+                f,
+                "failed to allocate memory, the allocated size is {}, align is {}",
+                layout.size(),
+                layout.align()
+            ),
             ErrorKind::Utf8Error(e) => write!(f, "{e}"),
             ErrorKind::InvalidUtf16 => write!(f, "invalid UTF-16: lone surrogate found"),
             ErrorKind::FromUtf16OddLength => {
@@ -176,7 +184,7 @@ impl<S> Error for ToGStrError<S> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             ErrorKind::LengthOverflow(_)
-            | ErrorKind::AllocationFailure
+            | ErrorKind::AllocationFailure(_)
             | ErrorKind::InvalidUtf16
             | ErrorKind::FromUtf16OddLength => None,
             ErrorKind::Utf8Error(e) => Some(e),
@@ -474,7 +482,7 @@ pub struct GStr {
 }
 
 impl GStr {
-    /// The maximum length of [`GStr`].
+    /// The maximum length of [`GStr`] in bytes.
     pub const MAX_LENGTH: usize = PrefixAndLength::MAX_LENGTH;
 
     /// The empty string of [`GStr`].
@@ -524,7 +532,7 @@ impl GStr {
                 Ok(Self {
                     // SAFETY: `ptr` isn't null.
                     ptr: unsafe { NonNull::new_unchecked(ptr) },
-                    // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
+                    // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
                     prefix_and_len: unsafe {
                         PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
                     },
@@ -558,7 +566,7 @@ impl GStr {
             Ok(s) => s,
             Err(e) => match e.kind {
                 ErrorKind::LengthOverflow(_) => panic!("{}", e),
-                ErrorKind::AllocationFailure => handle_alloc_error(e.as_str()),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                 // SAFETY: `GStr::try_new` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
@@ -589,7 +597,7 @@ impl GStr {
             Self {
                 // SAFETY: The pointer which points to `string`'s buffer is non-null.
                 ptr: unsafe { NonNull::new_unchecked(string.as_ptr().cast_mut()) },
-                // SAFETY: `string.len()` isn't greater than `Length::MAX_LENGTH`.
+                // SAFETY: `string.len()` isn't greater than `PrefixAndLength::MAX_LENGTH`.
                 prefix_and_len: unsafe {
                     PrefixAndLength::new_static_unchecked(
                         copy_prefix(string.as_bytes()),
@@ -645,7 +653,7 @@ impl GStr {
                     Ok(Self {
                         // SAFETY: The pointer which points to the string buffer is non-null.
                         ptr: unsafe { NonNull::new_unchecked(s.as_mut_ptr()) },
-                        // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
+                        // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
                         prefix_and_len: unsafe {
                             PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
                         },
@@ -688,7 +696,7 @@ impl GStr {
             Ok(s) => s,
             Err(e) => match e.kind {
                 ErrorKind::LengthOverflow(_) => panic!("{}", e),
-                ErrorKind::AllocationFailure => handle_alloc_error(e),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                 // SAFETY: `GStr::try_from_string` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
@@ -740,7 +748,7 @@ impl GStr {
         match buf {
             RawBuffer::Static(ptr) => Self {
                 ptr,
-                // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
+                // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
                 prefix_and_len: unsafe {
                     PrefixAndLength::new_static_unchecked(copy_prefix(bytes), len)
                 },
@@ -754,7 +762,7 @@ impl GStr {
 
                 Self {
                     ptr,
-                    // SAFETY: `len` isn't greater than `Length::MAX_LENGTH`.
+                    // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
                     prefix_and_len: unsafe {
                         PrefixAndLength::new_unchecked(copy_prefix(bytes), len)
                     },
@@ -1440,7 +1448,10 @@ impl GStr {
     pub fn into_string(self) -> String {
         match self.try_into_string() {
             Ok(s) => s,
-            Err(s) => handle_alloc_error(s),
+            // SAFETY: The layout of a `GStr` is valid.
+            Err(s) => unsafe {
+                handle_alloc_error(Layout::array::<u8>(s.len()).unwrap_unchecked())
+            },
         }
     }
 
@@ -1586,7 +1597,7 @@ impl GStr {
             match Self::try_from_string(s) {
                 Ok(s) => s,
                 Err(e) => match e.kind {
-                    ErrorKind::AllocationFailure => handle_alloc_error(e),
+                    ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                     // SAFETY:
                     // - `total_len` isn't greater than `GStr::MAX_LENGTH`.
                     // - `GStr::try_from_string` doesn't return other errors.
@@ -1675,7 +1686,7 @@ impl Clone for GStr {
             match Self::try_new(self) {
                 Ok(s) => s,
                 Err(e) => match e.kind {
-                    ErrorKind::AllocationFailure => handle_alloc_error(e),
+                    ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                     // SAFETY:
                     // - A `GStr`'s length isn't greater than `GStr::MAX_LENGTH`.
                     // - `GStr::try_new` doesn't return other errors.
@@ -1911,7 +1922,7 @@ impl From<char> for GStr {
         match Self::try_new(s) {
             Ok(s) => s,
             Err(e) => match e.kind {
-                ErrorKind::AllocationFailure => handle_alloc_error(e),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                 // SAFETY:
                 // - The max length in bytes of a single UTF-8 character is 4.
                 // - `GStr::try_new` doesn't return other errors.
@@ -2237,8 +2248,11 @@ const fn empty_gstr() -> GStr {
 /// Returns an allocation failure error.
 #[cold]
 #[inline(never)]
-fn allocation_failure<S>(string: S) -> Result<GStr, ToGStrError<S>> {
-    Err(ToGStrError::new_allocation_failure(string))
+fn allocation_failure<S: AsRef<str>>(string: S) -> Result<GStr, ToGStrError<S>> {
+    // SAFETY: The layout of `string` is valid.
+    let layout = unsafe { Layout::array::<u8>(string.as_ref().len()).unwrap_unchecked() };
+
+    Err(ToGStrError::new_allocation_failure(string, layout))
 }
 
 /// Returns a length overflow error.
@@ -2253,11 +2267,8 @@ fn length_overflow<S>(string: S, len: usize) -> Result<GStr, ToGStrError<S>> {
 /// For more details, see [`handle_alloc_error`](alloc::alloc::handle_alloc_error).
 #[cold]
 #[inline(never)]
-pub(crate) fn handle_alloc_error<B: AsRef<[u8]>>(buf: B) -> ! {
-    // SAFETY: The layout of the buffer is valid.
-    unsafe {
-        alloc::alloc::handle_alloc_error(Layout::array::<u8>(buf.as_ref().len()).unwrap_unchecked())
-    }
+pub(crate) fn handle_alloc_error(layout: Layout) -> ! {
+    alloc::alloc::handle_alloc_error(layout)
 }
 
 const _: () = {
