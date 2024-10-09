@@ -9,6 +9,7 @@ use core::{
     ptr::{self, NonNull},
     slice::{self, SliceIndex},
     str::{FromStr, Utf8Error},
+    sync::atomic::{self, AtomicUsize},
 };
 
 extern crate alloc;
@@ -22,13 +23,17 @@ use alloc::{
     vec::Vec,
 };
 
+const ATOMIC_SIZE: usize = size_of::<AtomicUsize>();
+
+const ATOMIC_ALIGN: usize = align_of::<AtomicUsize>();
+
 /// Represents the different kinds of errors in [`ToGStrError`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
     /// Indicates that the string's length exceeds the maximum allowed length
-    /// ([`GStr::MAX_LENGTH`]).
+    /// ([`MAX_LENGTH`](GStr::MAX_LENGTH)).
     ///
-    /// The wrapped [`usize`] represents the actual length of the string.
+    /// The wrapped [`usize`] represents the requested length of the string.
     LengthOverflow(usize),
     /// Occurs when there is a failure to allocate memory.
     ///
@@ -122,6 +127,15 @@ impl<S> ToGStrError<S> {
             source: f(self.source),
         }
     }
+
+    /// Removes the source.
+    #[inline]
+    pub fn remove_source(self) -> ToGStrError<()> {
+        ToGStrError {
+            kind: self.kind,
+            source: (),
+        }
+    }
 }
 
 impl<S: AsRef<str>> ToGStrError<S> {
@@ -160,9 +174,7 @@ impl<S> fmt::Display for ToGStrError<S> {
         match self.kind {
             ErrorKind::LengthOverflow(len) => write!(
                 f,
-                "the source's length {} shouldn't be greater than `GStr`'s max length {}",
-                GStr::MAX_LENGTH,
-                len
+                "the source's length {len} shouldn't be greater than `GStr`'s maximum length",
             ),
             ErrorKind::AllocationFailure(layout) => write!(
                 f,
@@ -472,24 +484,555 @@ impl PrefixAndLength {
     }
 }
 
+/// An error for [`StringBuffer`].
+enum StringBufferError {
+    /// Indicates that the string buffer's length exceeds the maximum allowed capacity
+    /// ([`MAX_CAPACITY`](StringBuffer::MAX_CAPACITY)).
+    ///
+    /// The wrapped [`usize`] represents the requested capacity of the string buffer.
+    CapacityOverflow(usize),
+    /// Occurs when there is a failure to allocate memory.
+    ///
+    /// The wrapped [`Layout`] represents the layout of the memory allocation that failed.
+    AllocationFailure(Layout),
+}
+
+impl StringBufferError {
+    /// Returns an error from a closure.
+    #[cold]
+    fn return_err<F: FnOnce() -> Self>(f: F) -> Result<(), Self> {
+        Err(f())
+    }
+
+    /// Panics with the error.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the capacity exceed [`MAX_CAPACITY`](StringBuffer::MAX_CAPACITY).
+    /// - Panics if fails to allocate memory.
+    #[cold]
+    fn panic(self) -> ! {
+        match self {
+            Self::CapacityOverflow(capacity) => {
+                panic!("the string buffer's capacity {capacity} shouldn't be greater than its maximum capacity");
+            }
+            Self::AllocationFailure(layout) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Converts the error into a [`ToGStrError`].
+    #[inline]
+    fn into_gstr_error<S>(self, source: S) -> ToGStrError<S> {
+        match self {
+            Self::CapacityOverflow(capacity) => ToGStrError::new_length_overflow(source, capacity),
+            Self::AllocationFailure(layout) => ToGStrError::new_allocation_failure(source, layout),
+        }
+    }
+}
+
+/// A string buffer.
+struct StringBuffer<const SHARED: bool> {
+    /// This pointer points to a valid UTF-8 string buffer.
+    ///
+    /// If `SHARED` is true, an [`AtomicUsize`] is stored before the string buffer.
+    ptr: NonNull<u8>,
+    /// The string buffer's length.
+    len: usize,
+    /// The string buffer's capacity.
+    capacity: usize,
+}
+
+impl<const SHARED: bool> StringBuffer<SHARED> {
+    /// The maximum capacity of a [`StringBuffer`].
+    const MAX_CAPACITY: usize = GStr::<SHARED>::MAX_LENGTH;
+
+    /// Returns the size of the layout for a string buffer with the given length.
+    ///
+    /// The returned value isn't less than `len`.
+    ///
+    /// If `SHARED` is true, the returned value is `ATOMIC_SIZE + len`.
+    ///
+    /// # Safety
+    ///
+    /// `len` must not be greater than [`MAX_CAPACITY`](Self::MAX_CAPACITY).
+    #[inline]
+    const unsafe fn layout_size(len: usize) -> usize {
+        if SHARED {
+            ATOMIC_SIZE + len
+        } else {
+            len
+        }
+    }
+
+    /// Returns the alignment of the layout for a string buffer.
+    ///
+    /// The returned value is a power of two.
+    ///
+    /// If `SHARED` is true, the returned value is [`ATOMIC_ALIGN`].
+    #[inline]
+    const fn layout_align() -> usize {
+        if SHARED {
+            ATOMIC_ALIGN
+        } else {
+            align_of::<u8>()
+        }
+    }
+
+    /// Returns the layout for a string buffer with the given length.
+    ///
+    /// The returned layout's size isn't less than `len`.
+    ///
+    /// If `SHARED` is true, the returned layout's size is `ATOMIC_SIZE + len` and its alignment
+    /// is [`ATOMIC_ALIGN`].
+    ///
+    /// # Safety
+    ///
+    /// `len` must not be greater than [`MAX_CAPACITY`](Self::MAX_CAPACITY).
+    #[inline]
+    const unsafe fn layout(len: usize) -> Layout {
+        debug_assert!(len <= Self::MAX_CAPACITY);
+
+        // SAFETY:
+        // - `len` is guaranteed that it isn't greater than `MAX_CAPACITY` which can't overflow
+        //   `isize`.
+        // - The alignment returned by `layout_align` is a power of two.
+        unsafe { Layout::from_size_align_unchecked(Self::layout_size(len), Self::layout_align()) }
+    }
+
+    /// Creates a new empty [`StringBuffer`].
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    /// Creates a new [`StringBuffer`] with the given capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string buffer's length is greater than
+    /// [`MAX_CAPACITY`](Self::MAX_CAPACITY) or allocation failure occurs.
+    #[inline]
+    fn try_with_capacity(capacity: usize) -> Result<Self, StringBufferError> {
+        let mut buffer = Self::new();
+        buffer.grow_memory(capacity)?;
+
+        Ok(buffer)
+    }
+
+    /// Creates a new [`StringBuffer`] with the given capacity.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the string buffer capacity is greater than [`MAX_CAPACITY`](Self::MAX_CAPACITY).
+    /// - Calls [`handle_alloc_error`] if fails to allocate heap memory.
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    fn with_capacity(capacity: usize) -> Self {
+        match Self::try_with_capacity(capacity) {
+            Ok(buffer) => buffer,
+            Err(err) => err.panic(),
+        }
+    }
+
+    /// Returns the pointer which points to the memory buffer.
+    ///
+    /// # Safety
+    ///
+    /// The string buffer's capacity must be greater than zero.
+    #[inline]
+    unsafe fn memory_ptr(&mut self) -> *mut u8 {
+        if SHARED {
+            // SAFETY: If `SHARED` is true, there is an `AtomicUsize` stored before the string
+            //         buffer. They are in the same allocated object.
+            unsafe { self.ptr.sub(ATOMIC_SIZE).as_ptr() }
+        } else {
+            self.ptr.as_ptr()
+        }
+    }
+
+    /// Grows the memory buffer for the additional capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string buffer's length is greater than
+    /// [`MAX_CAPACITY`](Self::MAX_CAPACITY) or allocation failure occurs.
+    #[inline]
+    fn grow_memory(&mut self, additional: usize) -> Result<(), StringBufferError> {
+        debug_assert!(self.capacity <= Self::MAX_CAPACITY);
+        debug_assert!(self.len <= self.capacity);
+
+        if self.capacity == 0 {
+            if additional > 0 {
+                if additional <= Self::MAX_CAPACITY {
+                    // SAFETY: `additional` isn't greater than `MAX_CAPACITY`.
+                    let layout = unsafe { Self::layout(additional) };
+                    // SAFETY: `additional` is greater than zero, so the size of `layout` is greater
+                    //         than zero.
+                    let mut ptr = unsafe { alloc::alloc::alloc(layout) };
+
+                    if ptr.is_null() {
+                        return StringBufferError::return_err(|| {
+                            StringBufferError::AllocationFailure(layout)
+                        });
+                    }
+
+                    if SHARED {
+                        // SAFETY: `SHARED` is true, the size of the memory pointed by `ptr` is
+                        //         greater than the size of `AtomicUsize` and its alignment is the
+                        //         same as `AtomicUsize`. So `ptr` is valid for writes of
+                        //         `AtomicUsize`.
+                        unsafe {
+                            ptr::write(ptr.cast::<AtomicUsize>(), AtomicUsize::new(1));
+                        }
+                        // SAFETY: The size of the memory pointed by `ptr` is greater than
+                        //         `ATOMIC_SIZE`.
+                        ptr = unsafe { ptr.add(ATOMIC_SIZE) };
+                    }
+
+                    // SAFETY: `ptr` isn't null.
+                    self.ptr = unsafe { NonNull::new_unchecked(ptr) };
+                    self.capacity = additional;
+                } else {
+                    return StringBufferError::return_err(|| {
+                        StringBufferError::CapacityOverflow(additional)
+                    });
+                }
+            }
+        // The string buffer's capacity isn't less than its length, so `self.capacity - self.len`
+        // doesn't overflow.
+        } else if self.capacity - self.len < additional {
+            // The string buffer's capacity isn't greater than `MAX_CAPACITY`, so
+            // `self.capacity * 2` doesn't overflow. `self.capacity - self.len < additional` means
+            // that `additional` is greater than zero, so `new_capacity` is also greater than zero.
+            let new_capacity = (self.capacity * 2)
+                .min(Self::MAX_CAPACITY)
+                .max(self.capacity.saturating_add(additional));
+
+            if new_capacity <= Self::MAX_CAPACITY {
+                // SAFETY: The string buffer's capacity isn't greater than `MAX_CAPACITY`.
+                let old_layout = unsafe { Self::layout(self.capacity) };
+                // SAFETY:
+                // - The string buffer's capacity is greater than zero, so `self.memory_ptr()`
+                //   returns the pointer which is currently allocated via the global allocator.
+                // - `old_layout` is the same layout that was used to allocate that block of memory.
+                // - `new_capacity` is greater than zero, so the size returned by
+                //   `Self::layout_size(new_capacity)` is greater than zero and it can't overflow
+                //   `isize`.
+                let mut ptr = unsafe {
+                    alloc::alloc::realloc(
+                        self.memory_ptr(),
+                        old_layout,
+                        Self::layout_size(new_capacity),
+                    )
+                };
+
+                if ptr.is_null() {
+                    // SAFETY: `new_capacity` isn't greater than `MAX_CAPACITY`.
+                    return StringBufferError::return_err(|| unsafe {
+                        StringBufferError::AllocationFailure(Self::layout(new_capacity))
+                    });
+                }
+
+                if SHARED {
+                    // SAFETY: `SHARED` is true, so the size of the memory pointed by `ptr` is
+                    //         greater than `ATOMIC_SIZE`.
+                    ptr = unsafe { ptr.add(ATOMIC_SIZE) };
+                }
+
+                // SAFETY: `ptr` isn't null.
+                self.ptr = unsafe { NonNull::new_unchecked(ptr) };
+                self.capacity = new_capacity;
+            } else {
+                return StringBufferError::return_err(|| {
+                    StringBufferError::CapacityOverflow(new_capacity)
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Shrinks the string buffer's capacity to match its length.
+    ///
+    /// # Safety
+    ///
+    /// The string buffer's length must be greater than zero.
+    ///
+    /// # Error
+    ///
+    /// Returns an [`Err`] if fails to shrink the string buffer.
+    #[inline]
+    unsafe fn shrink(&mut self) -> Result<(), StringBufferError> {
+        debug_assert!(self.len > 0);
+        debug_assert!(self.capacity >= self.len);
+
+        if self.capacity > self.len {
+            // SAFETY: The string buffer's capacity isn't greater than `MAX_CAPACITY`.
+            let old_layout = unsafe { Self::layout(self.capacity) };
+            // SAFETY:
+            // - The string buffer's capacity is greater than its length, the capacity is greater
+            //   than zero, so `self.memory_ptr()` returns the pointer which is currently allocated
+            //   via the global allocator.
+            // - `old_layout` is the same layout that was used to allocate that block of memory.
+            // - The string buffer's length is guaranteed to be in the range `1..=MAX_CAPACITY`, so
+            //   the new size returned from `layout_size` is greater than zero and it can't overflow
+            //   `isize`.
+            let mut ptr = unsafe {
+                alloc::alloc::realloc(self.memory_ptr(), old_layout, Self::layout_size(self.len))
+            };
+
+            if ptr.is_null() {
+                return StringBufferError::return_err(|| {
+                    // SAFETY: The string buffer's length is guaranteed that it isn't greater than
+                    //         `MAX_CAPACITY`.
+                    StringBufferError::AllocationFailure(unsafe { Self::layout(self.len) })
+                });
+            }
+
+            if SHARED {
+                // SAFETY: `SHARED` is true, so the size of the memory pointed by `ptr` is
+                //         greater than `ATOMIC_SIZE`.
+                ptr = unsafe { ptr.add(ATOMIC_SIZE) };
+            }
+
+            // SAFETY: `ptr` isn't null.
+            self.ptr = unsafe { NonNull::new_unchecked(ptr) };
+            self.capacity = self.len;
+        }
+
+        Ok(())
+    }
+
+    /// Pushes a slice of bytes to the string buffer.
+    ///
+    /// # Safety
+    ///
+    /// `slice` must be a valid UTF-8 sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string buffer's length is greater than
+    /// [`MAX_CAPACITY`](Self::MAX_CAPACITY) or allocation failure occurs.
+    #[inline]
+    unsafe fn try_push_slice(&mut self, slice: &[u8]) -> Result<(), StringBufferError> {
+        let slice_len = slice.len();
+        self.grow_memory(slice_len)?;
+        debug_assert!(self.capacity - self.len >= slice_len);
+
+        // SAFETY:
+        // - `slice.as_ptr()` is properly aligned and valid for reads of `slice_len` bytes.
+        // - After calling `grow_memory`, the string buffer's capacity isn't less than its length
+        //   plus `slice_len`, so `self.ptr.add(self.len).as_ptr()` is properly aligned and valid
+        //   for writes of `slice_len` bytes.
+        // - The slice's memory and the string buffer's memory can't overlap each other.
+        unsafe {
+            ptr::copy_nonoverlapping::<u8>(
+                slice.as_ptr(),
+                self.ptr.add(self.len).as_ptr(),
+                slice_len,
+            );
+        }
+        self.len += slice_len;
+
+        Ok(())
+    }
+
+    /// Pushes a [`char`] to the string buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string buffer's length is greater than
+    /// [`MAX_CAPACITY`](Self::MAX_CAPACITY) or allocation failure occurs.
+    #[inline]
+    fn try_push_char(&mut self, ch: char) -> Result<(), StringBufferError> {
+        // SAFETY: `encode_utf8` converts `ch` to a valid UTF-8 sequence.
+        unsafe { self.try_push_slice(ch.encode_utf8(&mut [0; 4]).as_bytes()) }
+    }
+
+    /// Pushes a [`char`] to the string buffer.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the string buffer capacity is greater than [`MAX_CAPACITY`](Self::MAX_CAPACITY).
+    /// - Calls [`handle_alloc_error`] if fails to allocate heap memory.
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    fn push_char(&mut self, ch: char) {
+        if let Err(err) = self.try_push_char(ch) {
+            err.panic();
+        }
+    }
+
+    /// Pushes a [`str`] to the string buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string buffer's length is greater than
+    /// [`MAX_CAPACITY`](Self::MAX_CAPACITY) or allocation failure occurs.
+    #[inline]
+    fn try_push_str(&mut self, string: &str) -> Result<(), StringBufferError> {
+        // SAFETY: a `str` is always a valid UTF-8 sequence.
+        unsafe { self.try_push_slice(string.as_bytes()) }
+    }
+
+    /// Pushes a [`str`] to the string buffer.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the string buffer capacity is greater than [`MAX_CAPACITY`](Self::MAX_CAPACITY).
+    /// - Calls [`handle_alloc_error`] if fails to allocate heap memory.
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    fn push_str(&mut self, string: &str) {
+        if let Err(err) = self.try_push_str(string) {
+            err.panic();
+        }
+    }
+
+    /// Converts the string buffer into a [`GStr`].
+    ///
+    /// # Error
+    ///
+    /// Returns an [`Err`] if fails to shrink the string buffer.
+    #[inline]
+    fn try_into_gstr(mut self) -> Result<GStr<SHARED>, StringBufferError> {
+        if self.len == 0 {
+            Ok(empty_gstr::<SHARED>())
+        } else {
+            // SAFETY: The string buffer's length is greater than zero.
+            unsafe {
+                self.shrink()?;
+            }
+            debug_assert!(self.len == self.capacity);
+            debug_assert!(self.len <= GStr::<SHARED>::MAX_LENGTH);
+
+            let buffer = ManuallyDrop::new(self);
+
+            Ok(GStr::<SHARED> {
+                ptr: buffer.ptr,
+                // SAFETY:
+                // - The string buffer can be converted to a slice of `u8`.
+                // - The string buffer's length isn't greater than `MAX_CAPACITY`, so it's also less
+                //   than `PrefixAndLength::MAX_LENGTH`.
+                // - The returned `GStr` is heap-allocated.
+                prefix_and_len: unsafe {
+                    PrefixAndLength::new_unchecked(
+                        copy_prefix(slice::from_raw_parts(buffer.ptr.as_ptr(), buffer.len)),
+                        buffer.len,
+                    )
+                },
+            })
+        }
+    }
+
+    /// Converts the string buffer into a [`GStr`].
+    ///
+    /// # Panics
+    ///
+    /// Calls [`handle_alloc_error`] if fails to shrink the string buffer.
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    fn into_gstr(self) -> GStr<SHARED> {
+        match self.try_into_gstr() {
+            Ok(gstr) => gstr,
+            Err(StringBufferError::AllocationFailure(layout)) => handle_alloc_error(layout),
+            // SAFETY: `try_into_gstr` doesn't return `StringBufferError::CapacityOverflow` error.
+            Err(StringBufferError::CapacityOverflow(_)) => unsafe {
+                core::hint::unreachable_unchecked()
+            },
+        }
+    }
+}
+
+impl<const SHARED: bool> Drop for StringBuffer<SHARED> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.capacity > 0 {
+            // SAFETY:
+            // - The pointer returned from `self.memory_ptr()` points the memory which is currently
+            //   allocated via the global allocator.
+            // - The string buffer's capacity isn't greater than `MAX_CAPACITY`.
+            // - `Self::layout(self.capacity)` returns the layout which was used to allocate the
+            //   memory.
+            unsafe {
+                alloc::alloc::dealloc(self.memory_ptr(), Self::layout(self.capacity));
+            }
+        }
+    }
+}
+
+impl<const SHARED: bool> FromIterator<char> for StringBuffer<SHARED> {
+    fn from_iter<T: IntoIterator<Item = char>>(iter: T) -> Self {
+        let iter = iter.into_iter();
+        let (lower_bound, _) = iter.size_hint();
+        let mut buffer = Self::with_capacity(lower_bound);
+        for ch in iter {
+            buffer.push_char(ch);
+        }
+
+        buffer
+    }
+}
+
 /// An immutable string implementation optimized for small strings and comparison.
 // NOTE: If the string buffer is heap allocated, it can't be empty.
-pub struct GStr {
+pub struct GStr<const SHARED: bool> {
     /// The pointer which points to the string buffer.
+    ///
+    /// If `SHARED` is true and the string buffer is heap-allocated, an [`AtomicUsize`] is stored
+    /// before the string buffer.
     ptr: NonNull<u8>,
     /// The prefix buffer and the length of the string buffer.
     prefix_and_len: PrefixAndLength,
 }
 
-impl GStr {
+impl<const SHARED: bool> GStr<SHARED> {
     /// The maximum length of [`GStr`] in bytes.
-    pub const MAX_LENGTH: usize = PrefixAndLength::MAX_LENGTH;
+    pub const MAX_LENGTH: usize = if SHARED {
+        GStr::<true>::_MAX_LENGTH
+    } else {
+        GStr::<false>::_MAX_LENGTH
+    };
 
     /// The empty string of [`GStr`].
     pub const EMPTY: Self = Self::from_static("");
 
     /// The UTF-8 character used to replace invalid UTF-8 sequences.
     const UTF8_REPLACEMENT: &'static str = "\u{FFFD}";
+
+    /// Returns the layout of a [`GStr`] with the given length.
+    ///
+    /// If `SHARED` is false, the returned layout's size is `len` and the alignment is 1, otherwise
+    /// the returned layout's size is `ATOMIC_SIZE + len` and the alignment is `ATOMIC_ALIGN`.
+    ///
+    /// # Safety
+    ///
+    /// `len` must not be greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    #[inline]
+    unsafe fn layout(len: usize) -> Layout {
+        debug_assert!(len <= Self::MAX_LENGTH);
+
+        if SHARED {
+            // SAFETY:
+            // - `len` is guaranteed that it isn't greater than `MAX_LENGTH`, so
+            //   `ATOMIC_SIZE + len`, when rounded up to the nearest multiple of `ATOMIC_ALIGN`,
+            //   can't exceed `isize::MAX`.
+            // - `ATOMIC_ALIGN` is the alignment of `AtomicUsize`, so it is greater than zero and
+            //   it's a power of two.
+            unsafe { Layout::from_size_align_unchecked(ATOMIC_SIZE + len, ATOMIC_ALIGN) }
+        } else {
+            // SAFETY: `len` is guaranteed that it isn't greater than `MAX_LENGTH`.
+            unsafe { Layout::array::<u8>(len).unwrap_unchecked() }
+        }
+    }
 
     /// Creates a [`GStr`] from a string.
     ///
@@ -510,36 +1053,17 @@ impl GStr {
     /// ```
     pub fn try_new<S: AsRef<str>>(string: S) -> Result<Self, ToGStrError<S>> {
         let s = string.as_ref();
-        let len = s.len();
+        let mut buffer = StringBuffer::<SHARED>::new();
+        match buffer.try_push_str(s) {
+            Ok(_) => {}
+            Err(StringBufferError::CapacityOverflow(len)) => return length_overflow(string, len),
+            Err(StringBufferError::AllocationFailure(_)) => return allocation_failure(string),
+        }
 
-        if len == 0 {
-            Ok(empty_gstr())
-        } else if len <= Self::MAX_LENGTH {
-            // SAFETY:
-            // - The layout of `s` is valid.
-            // - `len` is greater than 0, so the layout's size isn't 0.
-            let ptr = unsafe { alloc::alloc::alloc(Layout::array::<u8>(len).unwrap_unchecked()) };
-
-            if ptr.is_null() {
-                allocation_failure(string)
-            } else {
-                // SAFETY: `s.as_ptr()` is valid for reads of `len` bytes and `ptr` is valid for
-                //         writes of `len` bytes`.
-                unsafe {
-                    ptr::copy_nonoverlapping::<u8>(s.as_ptr(), ptr, len);
-                }
-
-                Ok(Self {
-                    // SAFETY: `ptr` isn't null.
-                    ptr: unsafe { NonNull::new_unchecked(ptr) },
-                    // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
-                    prefix_and_len: unsafe {
-                        PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
-                    },
-                })
-            }
-        } else {
-            length_overflow(string, len)
+        match buffer.try_into_gstr() {
+            Ok(gstr) => Ok(gstr),
+            // SAFETY: `buffer`'s capacity is equal to its length, so it can't be shrinked.
+            Err(_) => unsafe { core::hint::unreachable_unchecked() },
         }
     }
 
@@ -550,7 +1074,7 @@ impl GStr {
     /// # Panics
     ///
     /// - Panics if the length of `string` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate heap memory.
+    /// - Calls [`handle_alloc_error`] if fails to allocate heap memory.
     ///
     /// # Example
     ///
@@ -560,6 +1084,8 @@ impl GStr {
     /// let string = GStr::new("Hello, World!");
     /// assert_eq!(string, "Hello, World!");
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[must_use]
     pub fn new<S: AsRef<str>>(string: S) -> Self {
         match Self::try_new(string) {
@@ -610,167 +1136,6 @@ impl GStr {
         }
     }
 
-    /// Creates a [`GStr`] from a [`String`].
-    ///
-    /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
-    /// capacity is equal to its length, no reallocation occurs.
-    ///
-    /// If the string is empty, [`GStr::EMPTY`] is returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
-    /// or shrinking the string's capacity fails.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use gstr::GStr;
-    ///
-    /// let string = String::from("Hello, World!");
-    /// let string_ptr = string.as_ptr();
-    /// let gstr = GStr::try_from_string(string).unwrap();
-    /// assert_eq!(gstr, "Hello, World!");
-    /// assert_eq!(string_ptr, gstr.as_ptr());
-    /// ```
-    #[inline]
-    pub fn try_from_string(string: String) -> Result<Self, ToGStrError<String>> {
-        let len = string.len();
-
-        if len == 0 {
-            Ok(empty_gstr())
-        } else if len <= Self::MAX_LENGTH {
-            // SAFETY: `string` isn't empty.
-            match unsafe { shrink_and_leak_string(string) } {
-                Ok(s) => {
-                    // SAFETY: The length of `s` returned from `shrink_and_leak_string` is equal to
-                    //         the length of `string`. This assertion is used to avoid some extra
-                    //         branches.
-                    unsafe {
-                        core::hint::assert_unchecked(s.len() == len);
-                    }
-
-                    Ok(Self {
-                        // SAFETY: The pointer which points to the string buffer is non-null.
-                        ptr: unsafe { NonNull::new_unchecked(s.as_mut_ptr()) },
-                        // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
-                        prefix_and_len: unsafe {
-                            PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
-                        },
-                    })
-                }
-                Err(s) => allocation_failure(s),
-            }
-        } else {
-            length_overflow(string, len)
-        }
-    }
-
-    /// Creates a [`GStr`] from a [`String`].
-    ///
-    /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
-    /// capacity is equal to its length, no reallocation occurs.
-    ///
-    /// If the string is empty, [`GStr::EMPTY`] is returned.
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the length of `string` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to shrink `string`'s capacity.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use gstr::GStr;
-    ///
-    /// let string = String::from("Hello, World!");
-    /// let string_ptr = string.as_ptr();
-    /// let gstr = GStr::from_string(string);
-    /// assert_eq!(gstr, "Hello, World!");
-    /// assert_eq!(string_ptr, gstr.as_ptr());
-    /// ```
-    #[inline]
-    #[must_use]
-    pub fn from_string(string: String) -> Self {
-        match Self::try_from_string(string) {
-            Ok(s) => s,
-            Err(e) => match e.kind {
-                ErrorKind::LengthOverflow(_) => panic!("{}", e),
-                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
-                // SAFETY: `GStr::try_from_string` doesn't return other errors.
-                _ => unsafe { core::hint::unreachable_unchecked() },
-            },
-        }
-    }
-
-    /// Creates a [`GStr`] from a raw buffer and its length.
-    ///
-    /// If the raw buffer is static, when the returned [`GStr`] is dropped, the buffer's memory
-    /// won't be deallocated.
-    ///
-    /// # Safety
-    ///
-    /// - If the raw buffer is heap allocated, its memory needs to have been previously allocated
-    ///   by the global allocator, with a non-zero size of exactly `len` and an alignment of exactly
-    ///   one.
-    /// - If the raw buffer is static, its first `len` bytes must be valid.
-    /// - `len` must be less than or equal to [`MAX_LENGTH`](Self::MAX_LENGTH). If the raw buffer
-    ///   is heap allocated, `len` must be greater than zero.
-    /// - The first `len` bytes at `buf` must be valid UTF-8.
-    /// - The ownership of `buf` is effectively transferred to the return [`GStr`]. Ensure that
-    ///   nothing else uses the buffer pointer after calling this function.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gstr::GStr;
-    ///
-    /// let string = GStr::new("Hello, World!");
-    /// let (buf, len) = string.into_raw_parts();
-    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
-    /// assert_eq!(string, "Hello, World!");
-    ///
-    /// let string = GStr::from_static("Hello, Rust!");
-    /// let (buf, len) = string.into_raw_parts();
-    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
-    /// assert_eq!(string, "Hello, Rust!");
-    /// ```
-    #[inline]
-    #[must_use]
-    pub const unsafe fn from_raw_parts(buf: RawBuffer, len: usize) -> Self {
-        debug_assert!(len <= Self::MAX_LENGTH);
-
-        // SAFETY:
-        // - `buf.as_ptr()` is valid for reads for `len` bytes and it's properly aligned for `u8`.
-        // - `buf.as_ptr()` points to a valid UTF-8 string whose length in bytes is `len`.
-        let bytes = unsafe { slice::from_raw_parts(buf.as_ptr(), len) };
-
-        match buf {
-            RawBuffer::Static(ptr) => Self {
-                ptr,
-                // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
-                prefix_and_len: unsafe {
-                    PrefixAndLength::new_static_unchecked(copy_prefix(bytes), len)
-                },
-            },
-            RawBuffer::Heap(ptr) => {
-                // SAFETY: The raw buffer is heap allocated, so `len` is greater than 0. This
-                //         assertion can remove a branch in `copy_prefix`.
-                unsafe {
-                    core::hint::assert_unchecked(len > 0);
-                }
-
-                Self {
-                    ptr,
-                    // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
-                    prefix_and_len: unsafe {
-                        PrefixAndLength::new_unchecked(copy_prefix(bytes), len)
-                    },
-                }
-            }
-        }
-    }
-
     /// Converts a vector of bytes to a [`GStr`].
     ///
     /// # Errors
@@ -800,7 +1165,7 @@ impl GStr {
         } else {
             let s = String::from_utf8(bytes)?;
 
-            Self::try_from_string(s).map_err_source(String::into_bytes)
+            Self::gstr_try_from_string(s).map_err_source(String::into_bytes)
         }
     }
 
@@ -814,7 +1179,7 @@ impl GStr {
     /// # Panics
     ///
     /// - Panics if the length of `bytes` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to shrink the capacity of `bytes`.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -825,11 +1190,13 @@ impl GStr {
     /// let string = unsafe { GStr::from_utf8_unchecked(sparkle_heart) };
     /// assert_eq!(string, "💖");
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[inline]
     #[must_use]
     pub unsafe fn from_utf8_unchecked(bytes: Vec<u8>) -> Self {
         // SAFETY: `bytes` is guranteed to be a valid UTF-8 sequence.
-        unsafe { Self::from_string(String::from_utf8_unchecked(bytes)) }
+        unsafe { Self::gstr_from_string(String::from_utf8_unchecked(bytes)) }
     }
 
     /// Converts a slice of bytes to a [`GStr`], including invalid characters.
@@ -839,9 +1206,9 @@ impl GStr {
     ///
     /// # Panics
     ///
-    /// - Panics if the length in bytes of the UTF-8 sequence converted is greater than
+    /// - Panics if the length of the UTF-8 sequence converted in bytes is greater than
     ///   [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory or shrink the capacity of `bytes`.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -856,6 +1223,8 @@ impl GStr {
     /// let output = GStr::from_utf8_lossy(input);
     /// assert_eq!(output, "Hello �World");
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[must_use]
     pub fn from_utf8_lossy(bytes: Vec<u8>) -> Self {
         let mut iter = bytes.utf8_chunks();
@@ -876,18 +1245,18 @@ impl GStr {
             return empty_gstr();
         };
 
-        let mut res = String::with_capacity(bytes.len());
-        res.push_str(first_valid);
-        res.push_str(Self::UTF8_REPLACEMENT);
+        let mut buffer = StringBuffer::<SHARED>::with_capacity(bytes.len());
+        buffer.push_str(first_valid);
+        buffer.push_str(Self::UTF8_REPLACEMENT);
 
         for chunk in iter {
-            res.push_str(chunk.valid());
+            buffer.push_str(chunk.valid());
             if !chunk.invalid().is_empty() {
-                res.push_str(Self::UTF8_REPLACEMENT);
+                buffer.push_str(Self::UTF8_REPLACEMENT);
             }
         }
 
-        Self::from_string(res)
+        buffer.into_gstr()
     }
 
     /// Decode a UTF-16–encoded slice into a [`GStr`].
@@ -900,7 +1269,7 @@ impl GStr {
     ///
     /// # Panics
     ///
-    /// Panics if fails to allocate memory.
+    /// Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -913,13 +1282,22 @@ impl GStr {
     /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075,0xD800, 0x0069, 0x0063];
     /// assert!(GStr::from_utf16(v).is_err())
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     pub fn from_utf16<B: AsRef<[u16]>>(bytes: B) -> Result<Self, ToGStrError<B>> {
         let b = bytes.as_ref();
-
-        match String::from_utf16(b) {
-            Ok(s) => GStr::try_from_string(s).map_err_source(|_| bytes),
-            Err(_) => Err(ToGStrError::new_invalid_utf16(bytes)),
+        let mut buffer = StringBuffer::<SHARED>::with_capacity(b.len());
+        for result in char::decode_utf16(b.iter().copied()) {
+            if let Ok(ch) = result {
+                if let Err(err) = buffer.try_push_char(ch) {
+                    return Err(err.into_gstr_error(bytes));
+                }
+            } else {
+                return Err(ToGStrError::new_invalid_utf16(bytes));
+            }
         }
+
+        buffer.try_into_gstr().map_err(|e| e.into_gstr_error(bytes))
     }
 
     /// Decode a UTF-16–encoded slice into a [`GStr`], replacing invalid data with
@@ -929,7 +1307,7 @@ impl GStr {
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -942,9 +1320,13 @@ impl GStr {
     /// let v = &[0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834];
     /// assert_eq!(GStr::from_utf16_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[must_use]
     pub fn from_utf16_lossy<B: AsRef<[u16]>>(bytes: B) -> Self {
-        Self::from_string(String::from_utf16_lossy(bytes.as_ref()))
+        char::decode_utf16(bytes.as_ref().iter().copied())
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
     }
 
     /// Decode a UTF-16-little-endian–encoded slice into a [`GStr`]
@@ -957,7 +1339,7 @@ impl GStr {
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -972,6 +1354,8 @@ impl GStr {
     ///           0x00, 0xD8, 0x69, 0x00, 0x63, 0x00];
     /// assert!(GStr::from_utf16le(v).is_err())
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     pub fn from_utf16le<B: AsRef<[u8]>>(bytes: B) -> Result<Self, ToGStrError<B>> {
         let b = bytes.as_ref();
 
@@ -1010,7 +1394,7 @@ impl GStr {
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1026,6 +1410,8 @@ impl GStr {
     ///           0x34, 0xD8];
     /// assert_eq!(GStr::from_utf16le_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[must_use]
     pub fn from_utf16le_lossy<B: AsRef<[u8]>>(bytes: B) -> Self {
         let b = bytes.as_ref();
@@ -1036,7 +1422,12 @@ impl GStr {
         }) {
             (true, ([], v, [])) => Self::from_utf16_lossy(v),
             (true, ([], v, [_])) => {
-                Self::from_string(String::from_utf16_lossy(v) + Self::UTF8_REPLACEMENT)
+                let mut buffer = char::decode_utf16(v.iter().copied())
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect::<StringBuffer<SHARED>>();
+                buffer.push_str(Self::UTF8_REPLACEMENT);
+
+                buffer.into_gstr()
             }
             _ => {
                 let mut iter = b.chunks_exact(2);
@@ -1044,14 +1435,16 @@ impl GStr {
                 let u16_iter = iter.by_ref().map(|s| unsafe {
                     u16::from_le_bytes(<[u8; 2]>::try_from(s).unwrap_unchecked())
                 });
-                let string = char::decode_utf16(u16_iter)
+                let mut buffer = char::decode_utf16(u16_iter)
                     .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect::<String>();
+                    .collect::<StringBuffer<SHARED>>();
 
                 if iter.remainder().is_empty() {
-                    Self::from_string(string)
+                    buffer.into_gstr()
                 } else {
-                    Self::from_string(string + Self::UTF8_REPLACEMENT)
+                    buffer.push_str(Self::UTF8_REPLACEMENT);
+
+                    buffer.into_gstr()
                 }
             }
         }
@@ -1067,7 +1460,7 @@ impl GStr {
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1082,6 +1475,8 @@ impl GStr {
     ///           0xD8, 0x00, 0x00, 0x69, 0x00, 0x63];
     /// assert!(GStr::from_utf16be(v).is_err())
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     pub fn from_utf16be<B: AsRef<[u8]>>(bytes: B) -> Result<Self, ToGStrError<B>> {
         let b = bytes.as_ref();
 
@@ -1118,7 +1513,7 @@ impl GStr {
     ///
     /// - Panics if the length in bytes of the UTF-8 sequence converted from the UTF-16 sequence
     ///   is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1134,6 +1529,8 @@ impl GStr {
     ///           0xD8, 0x34];
     /// assert_eq!(GStr::from_utf16be_lossy(v), "𝄞mus\u{FFFD}ic\u{FFFD}")
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[must_use]
     pub fn from_utf16be_lossy<B: AsRef<[u8]>>(bytes: B) -> Self {
         let b = bytes.as_ref();
@@ -1142,7 +1539,12 @@ impl GStr {
         match (cfg!(target_endian = "big"), unsafe { b.align_to::<u16>() }) {
             (true, ([], v, [])) => Self::from_utf16_lossy(v),
             (true, ([], v, [_])) => {
-                Self::from_string(String::from_utf16_lossy(v) + Self::UTF8_REPLACEMENT)
+                let mut buffer = char::decode_utf16(v.iter().copied())
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+                    .collect::<StringBuffer<SHARED>>();
+                buffer.push_str(Self::UTF8_REPLACEMENT);
+
+                buffer.into_gstr()
             }
             _ => {
                 let mut iter = b.chunks_exact(2);
@@ -1150,16 +1552,123 @@ impl GStr {
                 let u16_iter = iter.by_ref().map(|s| unsafe {
                     u16::from_be_bytes(<[u8; 2]>::try_from(s).unwrap_unchecked())
                 });
-                let string = char::decode_utf16(u16_iter)
+                let mut buffer = char::decode_utf16(u16_iter)
                     .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect::<String>();
+                    .collect::<StringBuffer<SHARED>>();
 
                 if iter.remainder().is_empty() {
-                    Self::from_string(string)
+                    buffer.into_gstr()
                 } else {
-                    Self::from_string(string + Self::UTF8_REPLACEMENT)
+                    buffer.push_str(Self::UTF8_REPLACEMENT);
+
+                    buffer.into_gstr()
                 }
             }
+        }
+    }
+
+    /// Transmutes a [`GStr`] to a [`GStr`] specified by `S`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `S` isn't equal to `SHARED`.
+    #[inline]
+    fn transmute_from<const S: bool>(gstr: GStr<S>) -> Self {
+        if SHARED == S {
+            let gstr = ManuallyDrop::new(gstr);
+
+            Self {
+                ptr: gstr.ptr,
+                prefix_and_len: gstr.prefix_and_len,
+            }
+        } else {
+            panic!("`SHARED` must be equal to `S`")
+        }
+    }
+
+    /// Creates a [`GStr`] from a [`String`].
+    ///
+    /// If `SHARED` is false, this doesn't clone the string but shrinks it's capacity to match its
+    /// length. And if the string's capacity is equal to its length, no reallocation occurs.
+    ///
+    /// If the string is empty, [`GStr::EMPTY`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
+    /// or allocation failure occurs.
+    #[inline]
+    pub(crate) fn gstr_try_from_string(string: String) -> Result<Self, ToGStrError<String>> {
+        if SHARED {
+            Self::try_new(string)
+        } else {
+            Ok(Self::transmute_from(GStr::<false>::try_from_string(
+                string,
+            )?))
+        }
+    }
+
+    /// Creates a [`GStr`] from a [`String`].
+    ///
+    /// If `SHARED` is false, this doesn't clone the string but shrinks it's capacity to match its
+    /// length. And if the string's capacity is equal to its length, no reallocation occurs.
+    ///
+    /// If the string is empty, [`GStr::EMPTY`] is returned.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the length of `string` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    fn gstr_from_string(string: String) -> Self {
+        match Self::gstr_try_from_string(string) {
+            Ok(s) => s,
+            Err(e) => match e.kind {
+                ErrorKind::LengthOverflow(_) => panic!("{}", e),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
+                // SAFETY: `GStr::gstr_try_from_string` doesn't return other errors.
+                _ => unsafe { core::hint::unreachable_unchecked() },
+            },
+        }
+    }
+
+    /// Transmutes a [`GStr`] to a [`GStr`] specified by `S`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `S` isn't equal to `SHARED`.
+    #[inline]
+    fn transmute_to<const S: bool>(self) -> GStr<S> {
+        if SHARED == S {
+            let gstr = ManuallyDrop::new(self);
+
+            GStr::<S> {
+                ptr: gstr.ptr,
+                prefix_and_len: gstr.prefix_and_len,
+            }
+        } else {
+            panic!("`SHARED` must be equal to `S`")
+        }
+    }
+
+    /// Converts this [`GStr`] into a [`String`].
+    ///
+    /// If `SHARED` is false and the string buffer is heap-allocated, no allocation is performed.
+    /// Otherwise the string buffer is cloned into a new [`String`].
+    ///
+    /// # Panics
+    ///
+    /// Calls [`handle_alloc_error`] if fails to allocate memory.
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    pub(crate) fn gstr_into_string(self) -> String {
+        if SHARED {
+            String::from(self.as_str())
+        } else {
+            self.transmute_to::<false>().into_string()
         }
     }
 
@@ -1268,10 +1777,46 @@ impl GStr {
         self.ptr.as_ptr()
     }
 
-    /// Return a mutable raw pointer of the string buffer.
+    /// Return a mutable raw pointer of the allocated memory.
+    ///
+    /// # Safety
+    ///
+    /// This [`GStr`] must be heap-allocated.
     #[inline]
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
+    unsafe fn memory_ptr(&mut self) -> *mut u8 {
+        debug_assert!(self.is_heap());
+        debug_assert!(!self.is_empty());
+
+        if SHARED {
+            // SAFETY: If `SHARED` is true, there is an `AtomicUsize` stored before the string
+            //         buffer. They are in the same allocated object.
+            unsafe { self.ptr.sub(ATOMIC_SIZE).as_ptr() }
+        } else {
+            self.ptr.as_ptr()
+        }
+    }
+
+    /// Returns the layout of the allocated memory.
+    #[inline]
+    fn memory_layout(&self) -> Layout {
+        // SAFETY: A `GStr`'s length isn't greater than `MAX_LENGTH`.
+        unsafe { Self::layout(self.len()) }
+    }
+
+    /// Returns the reference count of this [`GStr`] if `SHARED` is true.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `SHARED` is false.
+    #[inline]
+    fn ref_count(&self) -> &AtomicUsize {
+        if SHARED {
+            // SAFETY: If `SHARED` is true, there is an `AtomicUsize` placed before the string
+            //         buffer. They are in the same allocated object.
+            unsafe { &*self.ptr.sub(ATOMIC_SIZE).cast::<AtomicUsize>().as_ptr() }
+        } else {
+            unreachable!("`ref_count` is only available when `SHARED` is true")
+        }
     }
 
     /// Returns a byte slice of this [`GStr`]'s contents.
@@ -1342,6 +1887,235 @@ impl GStr {
         }
     }
 
+    /// Concatenates two strings to a new [`GStr`].
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the total length in bytes of `self` and `string` is greater than
+    ///   [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - Calls [`handle_alloc_error`] if fails to allocate memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string1 = GStr::new("Hello ");
+    /// let string2 = string1.concat("World!");
+    /// assert_eq!(string2, "Hello World!");
+    /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[must_use]
+    pub fn concat<S: AsRef<str>>(&self, string: S) -> Self {
+        let a = self.as_str();
+        let b = string.as_ref();
+        let total_len = a.len() + b.len();
+
+        if total_len <= Self::MAX_LENGTH {
+            let mut buffer = StringBuffer::<SHARED>::with_capacity(total_len);
+            // SAFETY: `buffer`'s capacity isn't less than the length of `a`. This may remove some
+            //         branches in `push_str`.
+            unsafe {
+                core::hint::assert_unchecked(buffer.capacity >= a.len());
+            }
+            buffer.push_str(a);
+            // SAFETY: `buffer`'s remained capacity isn't less than the length of `b`. This may
+            //         remove some branches in `push_str`.
+            unsafe {
+                core::hint::assert_unchecked(buffer.capacity - buffer.len >= b.len());
+            }
+            buffer.push_str(b);
+
+            buffer.into_gstr()
+        } else {
+            panic!(
+                "The total length in bytes of two strings shouldn't be greater than `GStr`'s max length {}",
+                Self::MAX_LENGTH
+            );
+        }
+    }
+
+    /// Compares the prefix buffers.
+    #[inline]
+    fn prefix_cmp<const S: bool>(&self, other: &GStr<S>) -> Ordering {
+        self.prefix_and_len.prefix_cmp(other.prefix_and_len)
+    }
+
+    /// Returns whether the prefix buffers and the lengths of two [`GStr`]s are equal.
+    #[inline]
+    const fn prefix_len_eq<const S: bool>(&self, other: &GStr<S>) -> bool {
+        self.prefix_and_len.prefix_len_eq(other.prefix_and_len)
+    }
+}
+
+impl GStr<false> {
+    /// The maximum length of [`GStr`] in bytes.
+    const _MAX_LENGTH: usize = PrefixAndLength::MAX_LENGTH;
+
+    /// Creates a [`GStr`] from a [`String`].
+    ///
+    /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
+    /// capacity is equal to its length, no reallocation occurs.
+    ///
+    /// If the string is empty, [`GStr::EMPTY`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Err`] if the string's length is greater than [`MAX_LENGTH`](Self::MAX_LENGTH)
+    /// or shrinking the string's capacity fails.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::try_from_string(string).unwrap();
+    /// assert_eq!(gstr, "Hello, World!");
+    /// assert_eq!(string_ptr, gstr.as_ptr());
+    /// ```
+    #[inline]
+    pub fn try_from_string(string: String) -> Result<Self, ToGStrError<String>> {
+        let len = string.len();
+
+        if len == 0 {
+            Ok(empty_gstr())
+        } else if len <= Self::MAX_LENGTH {
+            // SAFETY: `string` isn't empty.
+            match unsafe { shrink_and_leak_string(string) } {
+                Ok(s) => {
+                    // SAFETY: The length of `s` returned from `shrink_and_leak_string` is equal to
+                    //         the length of `string`. This assertion is used to remove some extra
+                    //         branches.
+                    unsafe {
+                        core::hint::assert_unchecked(s.len() == len);
+                    }
+
+                    Ok(Self {
+                        // SAFETY: The pointer which points to the string buffer is non-null.
+                        ptr: unsafe { NonNull::new_unchecked(s.as_mut_ptr()) },
+                        // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
+                        prefix_and_len: unsafe {
+                            PrefixAndLength::new_unchecked(copy_prefix(s.as_bytes()), len)
+                        },
+                    })
+                }
+                Err(s) => allocation_failure(s),
+            }
+        } else {
+            length_overflow(string, len)
+        }
+    }
+
+    /// Creates a [`GStr`] from a [`String`].
+    ///
+    /// This doesn't clone the string but shrinks it's capacity to match its length. If the string's
+    /// capacity is equal to its length, no reallocation occurs.
+    ///
+    /// If the string is empty, [`GStr::EMPTY`] is returned.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the length of `string` is greater than [`MAX_LENGTH`](Self::MAX_LENGTH).
+    /// - Calls [`handle_alloc_error`] if fails to shrink `string`'s capacity.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = String::from("Hello, World!");
+    /// let string_ptr = string.as_ptr();
+    /// let gstr = GStr::from_string(string);
+    /// assert_eq!(gstr, "Hello, World!");
+    /// assert_eq!(string_ptr, gstr.as_ptr());
+    /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
+    #[inline]
+    #[must_use]
+    pub fn from_string(string: String) -> Self {
+        match Self::try_from_string(string) {
+            Ok(s) => s,
+            Err(e) => match e.kind {
+                ErrorKind::LengthOverflow(_) => panic!("{}", e),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
+                // SAFETY: `GStr::try_from_string` doesn't return other errors.
+                _ => unsafe { core::hint::unreachable_unchecked() },
+            },
+        }
+    }
+
+    /// Creates a [`GStr`] from a raw buffer and its length.
+    ///
+    /// If the raw buffer is static, when the returned [`GStr`] is dropped, the buffer's memory
+    /// won't be deallocated.
+    ///
+    /// # Safety
+    ///
+    /// - If the raw buffer is heap allocated, its memory needs to have been previously allocated
+    ///   by the global allocator, with a non-zero size of exactly `len` and an alignment of exactly
+    ///   one.
+    /// - If the raw buffer is static, its first `len` bytes must be valid.
+    /// - `len` must be less than or equal to [`MAX_LENGTH`](Self::MAX_LENGTH). If the raw buffer
+    ///   is heap allocated, `len` must be greater than zero.
+    /// - The first `len` bytes at `buf` must be valid UTF-8.
+    /// - The ownership of `buf` is effectively transferred to the return [`GStr`]. Ensure that
+    ///   nothing else uses the buffer pointer after calling this function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::GStr;
+    ///
+    /// let string = GStr::new("Hello, World!");
+    /// let (buf, len) = string.into_raw_parts();
+    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
+    /// assert_eq!(string, "Hello, World!");
+    ///
+    /// let string = GStr::from_static("Hello, Rust!");
+    /// let (buf, len) = string.into_raw_parts();
+    /// let string = unsafe { GStr::from_raw_parts(buf, len) };
+    /// assert_eq!(string, "Hello, Rust!");
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const unsafe fn from_raw_parts(buf: RawBuffer, len: usize) -> Self {
+        debug_assert!(len <= Self::MAX_LENGTH);
+
+        // SAFETY:
+        // - `buf.as_ptr()` is valid for reads for `len` bytes and it's properly aligned for `u8`.
+        // - `buf.as_ptr()` points to a valid UTF-8 string whose length in bytes is `len`.
+        let bytes = unsafe { slice::from_raw_parts(buf.as_ptr(), len) };
+
+        match buf {
+            RawBuffer::Static(ptr) => Self {
+                ptr,
+                // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
+                prefix_and_len: unsafe {
+                    PrefixAndLength::new_static_unchecked(copy_prefix(bytes), len)
+                },
+            },
+            RawBuffer::Heap(ptr) => {
+                // SAFETY: The raw buffer is heap allocated, so `len` is greater than 0. This
+                //         assertion can remove a branch in `copy_prefix`.
+                unsafe {
+                    core::hint::assert_unchecked(len > 0);
+                }
+
+                Self {
+                    ptr,
+                    // SAFETY: `len` isn't greater than `PrefixAndLength::MAX_LENGTH`.
+                    prefix_and_len: unsafe {
+                        PrefixAndLength::new_unchecked(copy_prefix(bytes), len)
+                    },
+                }
+            }
+        }
+    }
+
     /// Converts this [`GStr`] into a [`String`].
     ///
     /// If the string buffer is heap-allocated, no allocation is performed. Otherwise the string
@@ -1378,31 +2152,32 @@ impl GStr {
             debug_assert!(len > 0);
 
             // SAFETY:
-            // - The memory pointed by `string.as_mut_ptr()` was allocated by the global allocator
+            // - `string` is heap-allocated.
+            // - The memory pointed by `string.memory_ptr()` was allocated by the global allocator
             //   with a alignment of `u8`. And the size of this memory is `len`.
             // - The whole memory is a valid UTF-8 sequence.
             // - The ownership of the memory is transferred to the returned `String`.
-            unsafe { Ok(String::from_raw_parts(string.as_mut_ptr(), len, len)) }
+            unsafe { Ok(String::from_raw_parts(string.memory_ptr(), len, len)) }
         } else if len == 0 {
             /// Returns the empty string.
             #[cold]
-            fn return_empty_string() -> Result<String, GStr> {
+            fn return_empty_string() -> Result<String, GStr<false>> {
                 Ok(String::new())
             }
 
             return_empty_string()
         } else {
-            // SAFETY: The layout of the string buffer is valid and its size is greater than 0.
-            let ptr = unsafe { alloc::alloc::alloc(Layout::array::<u8>(len).unwrap_unchecked()) };
+            // SAFETY: The size of the string buffer's layout is greater than 0.
+            let ptr = unsafe { alloc::alloc::alloc(string.memory_layout()) };
 
             if ptr.is_null() {
                 /// Returns the original [`GStr`].
                 #[cold]
-                fn return_gstr(string: ManuallyDrop<GStr>) -> Result<String, GStr> {
+                fn return_err(string: ManuallyDrop<GStr<false>>) -> Result<String, GStr<false>> {
                     Err(ManuallyDrop::into_inner(string))
                 }
 
-                return_gstr(string)
+                return_err(string)
             } else {
                 // SAFETY: It's valid to copy `len` bytes from `string.as_ptr()` to `ptr`.
                 unsafe {
@@ -1426,7 +2201,7 @@ impl GStr {
     ///
     /// # Panics
     ///
-    /// Panics if fails to allocate memory.
+    /// Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1443,15 +2218,14 @@ impl GStr {
     /// let string = GStr::from_static("Hello, Rust!").into_string();
     /// assert_eq!(string, "Hello, Rust!");
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[inline]
     #[must_use]
     pub fn into_string(self) -> String {
         match self.try_into_string() {
             Ok(s) => s,
-            // SAFETY: The layout of a `GStr` is valid.
-            Err(s) => unsafe {
-                handle_alloc_error(Layout::array::<u8>(s.len()).unwrap_unchecked())
-            },
+            Err(s) => handle_alloc_error(s.memory_layout()),
         }
     }
 
@@ -1462,7 +2236,7 @@ impl GStr {
     ///
     /// # Panics
     ///
-    /// Panics if fails to allocate memory.
+    /// Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1479,6 +2253,8 @@ impl GStr {
     /// let boxed_str = GStr::from_static("Hello, Rust!").into_boxed_str();
     /// assert_eq!(boxed_str.as_ref(), "Hello, Rust!");
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[inline]
     #[must_use]
     pub fn into_boxed_str(self) -> Box<str> {
@@ -1492,7 +2268,7 @@ impl GStr {
     ///
     /// # Panics
     ///
-    /// Panics if fails to allocate memory.
+    /// Calls [`handle_alloc_error`] if fails to allocate memory.
     ///
     /// # Examples
     ///
@@ -1509,6 +2285,8 @@ impl GStr {
     /// let bytes = GStr::from_static("Hello, Rust!").into_bytes();
     /// assert_eq!(bytes, b"Hello, Rust!");
     /// ```
+    ///
+    /// [`handle_alloc_error`]: alloc::alloc::handle_alloc_error
     #[inline]
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
@@ -1553,94 +2331,60 @@ impl GStr {
 
         (buf, len)
     }
-
-    /// Compares the prefix buffers.
-    #[inline]
-    fn prefix_cmp(&self, other: &Self) -> Ordering {
-        self.prefix_and_len.prefix_cmp(other.prefix_and_len)
-    }
-
-    /// Returns whether the prefix buffers and the lengths of two [`GStr`]s are equal.
-    #[inline]
-    const fn prefix_len_eq(&self, other: &GStr) -> bool {
-        self.prefix_and_len.prefix_len_eq(other.prefix_and_len)
-    }
-
-    /// Concatenates two strings to a new [`GStr`].
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the total length in bytes of `self` and `string` is greater than
-    ///   [`MAX_LENGTH`](Self::MAX_LENGTH).
-    /// - Panics if fails to allocate memory.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gstr::GStr;
-    ///
-    /// let string1 = GStr::new("Hello ");
-    /// let string2 = string1.concat("World!");
-    /// assert_eq!(string2, "Hello World!");
-    /// ```
-    #[must_use]
-    pub fn concat<S: AsRef<str>>(&self, string: S) -> Self {
-        let a = self.as_str();
-        let b = string.as_ref();
-        let total_len = a.len() + b.len();
-
-        if total_len <= Self::MAX_LENGTH {
-            let mut s = String::with_capacity(total_len);
-            s.push_str(a);
-            s.push_str(b);
-
-            match Self::try_from_string(s) {
-                Ok(s) => s,
-                Err(e) => match e.kind {
-                    ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
-                    // SAFETY:
-                    // - `total_len` isn't greater than `GStr::MAX_LENGTH`.
-                    // - `GStr::try_from_string` doesn't return other errors.
-                    _ => unsafe { core::hint::unreachable_unchecked() },
-                },
-            }
-        } else {
-            panic!(
-                "The total length in bytes of two strings shouldn't be greater than `GStr`'s max length {}",
-                GStr::MAX_LENGTH
-            );
-        }
-    }
 }
 
-impl Drop for GStr {
+impl GStr<true> {
+    #[cfg(target_pointer_width = "64")]
+    /// The maximum length of [`GStr`] in bytes.
+    const _MAX_LENGTH: usize = PrefixAndLength::MAX_LENGTH;
+
+    #[cfg(target_pointer_width = "32")]
+    /// The maximum length of [`GStr`] in bytes.
+    const _MAX_LENGTH: usize = PrefixAndLength::MAX_LENGTH - (ATOMIC_ALIGN - 1) - ATOMIC_SIZE;
+}
+
+impl<const SHARED: bool> Drop for GStr<SHARED> {
     #[inline]
     fn drop(&mut self) {
         if self.is_heap() {
             debug_assert!(!self.is_empty());
 
-            // SAFETY:
-            // - The layout of the string buffer is valid.
-            // - `self.as_mut_ptr()` points to a memory allocated by the global allocator with the
-            //   string buffer's layout.
-            unsafe {
-                alloc::alloc::dealloc(
-                    self.as_mut_ptr(),
-                    Layout::array::<u8>(self.len()).unwrap_unchecked(),
-                );
+            if SHARED {
+                // We must make sure that nothing can access this `GStr`'s memory when dropping it,
+                // so `Ordering::Release` and `Ordering::Acquire` are used here.
+                if self.ref_count().fetch_sub(1, atomic::Ordering::Release) == 1 {
+                    atomic::fence(atomic::Ordering::Acquire);
+
+                    // SAFETY:
+                    // - The string buffer is heap-allocated.
+                    // - `self.memory_ptr()` points to a memory allocated by the global allocator
+                    //   with the layout returned from `memory_layout`. The reference count is 1,
+                    //   so this `GStr` owns the memory.
+                    unsafe {
+                        alloc::alloc::dealloc(self.memory_ptr(), self.memory_layout());
+                    }
+                }
+            } else {
+                // SAFETY:
+                // - The string buffer is heap-allocated.
+                // - `self.memory_ptr()` points to a memory allocated by the global allocator with
+                //   the string buffer's layout.
+                unsafe {
+                    alloc::alloc::dealloc(self.memory_ptr(), self.memory_layout());
+                }
             }
         }
     }
 }
 
-impl AsRef<str> for GStr {
+impl<const SHARED: bool> AsRef<str> for GStr<SHARED> {
     #[inline]
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl Deref for GStr {
+impl<const SHARED: bool> Deref for GStr<SHARED> {
     type Target = str;
 
     #[inline]
@@ -1649,16 +2393,17 @@ impl Deref for GStr {
     }
 }
 
-impl Borrow<str> for GStr {
+impl<const SHARED: bool> Borrow<str> for GStr<SHARED> {
     #[inline]
     fn borrow(&self) -> &str {
         self.as_str()
     }
 }
 
-impl fmt::Debug for GStr {
+impl<const SHARED: bool> fmt::Debug for GStr<SHARED> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GStr")
+            .field("shared", &SHARED)
             .field("is_static", &self.is_static())
             .field("len", &self.len())
             .field("prefix", &self.prefix())
@@ -1667,13 +2412,13 @@ impl fmt::Debug for GStr {
     }
 }
 
-impl fmt::Display for GStr {
+impl<const SHARED: bool> fmt::Display for GStr<SHARED> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self.as_str(), f)
     }
 }
 
-impl Clone for GStr {
+impl<const SHARED: bool> Clone for GStr<SHARED> {
     #[inline]
     fn clone(&self) -> Self {
         if self.is_heap() {
@@ -1683,15 +2428,39 @@ impl Clone for GStr {
                 core::hint::assert_unchecked(!self.is_empty());
             }
 
-            match Self::try_new(self) {
-                Ok(s) => s,
-                Err(e) => match e.kind {
-                    ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
-                    // SAFETY:
-                    // - A `GStr`'s length isn't greater than `GStr::MAX_LENGTH`.
-                    // - `GStr::try_new` doesn't return other errors.
-                    _ => unsafe { core::hint::unreachable_unchecked() },
-                },
+            if SHARED {
+                // We have accessed this `GStr`, its refernece count is greater than zero, so its
+                // memory can't be deallocated, using `Ordering::Relaxed` is safe here.
+                if self.ref_count().fetch_add(1, atomic::Ordering::Relaxed) > isize::MAX as usize {
+                    // If the reference count is greater than `isize::MAX`, aborts the program.
+                    #[cfg(feature = "std")]
+                    {
+                        extern crate std;
+
+                        std::process::abort();
+                    }
+
+                    #[cfg(not(feature = "std"))]
+                    {
+                        panic!("the reference count of `GStr` is greater than `isize::MAX`");
+                    }
+                }
+
+                Self {
+                    ptr: self.ptr,
+                    prefix_and_len: self.prefix_and_len,
+                }
+            } else {
+                match Self::try_new(self) {
+                    Ok(s) => s,
+                    Err(e) => match e.kind {
+                        ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
+                        // SAFETY:
+                        // - A `GStr`'s length isn't greater than `GStr::MAX_LENGTH`.
+                        // - `GStr::try_new` doesn't return other errors.
+                        _ => unsafe { core::hint::unreachable_unchecked() },
+                    },
+                }
             }
         } else {
             Self {
@@ -1702,16 +2471,16 @@ impl Clone for GStr {
     }
 }
 
-impl Default for GStr {
+impl<const SHARED: bool> Default for GStr<SHARED> {
     #[inline]
     fn default() -> Self {
         Self::EMPTY
     }
 }
 
-impl PartialEq for GStr {
+impl<const S1: bool, const S2: bool> PartialEq<GStr<S2>> for GStr<S1> {
     #[inline]
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, other: &GStr<S2>) -> bool {
         // Test if this two strings's lengths and prefix buffers are equal.
         if self.prefix_len_eq(other) {
             debug_assert_eq!(self.len(), other.len());
@@ -1730,16 +2499,19 @@ impl PartialEq for GStr {
     }
 }
 
-impl Eq for GStr {}
+impl<const SHARED: bool> Eq for GStr<SHARED> {}
 
-impl PartialOrd for GStr {
+impl<const S1: bool, const S2: bool> PartialOrd<GStr<S2>> for GStr<S1> {
     #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    fn partial_cmp(&self, other: &GStr<S2>) -> Option<Ordering> {
+        Some(match self.prefix_cmp(other) {
+            Ordering::Equal => self.as_bytes().cmp(other.as_bytes()),
+            not_eq => not_eq,
+        })
     }
 }
 
-impl Ord for GStr {
+impl<const SHARED: bool> Ord for GStr<SHARED> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         match self.prefix_cmp(other) {
@@ -1749,13 +2521,13 @@ impl Ord for GStr {
     }
 }
 
-impl Hash for GStr {
+impl<const SHARED: bool> Hash for GStr<SHARED> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str().hash(state);
     }
 }
 
-impl FromStr for GStr {
+impl<const SHARED: bool> FromStr for GStr<SHARED> {
     type Err = ToGStrError<()>;
 
     #[inline]
@@ -1764,7 +2536,7 @@ impl FromStr for GStr {
     }
 }
 
-impl<I: SliceIndex<str>> Index<I> for GStr {
+impl<I: SliceIndex<str>, const SHARED: bool> Index<I> for GStr<SHARED> {
     type Output = I::Output;
 
     #[inline]
@@ -1773,20 +2545,20 @@ impl<I: SliceIndex<str>> Index<I> for GStr {
     }
 }
 
-// SAFETY: A [`GStr`] can be transferred across different threads.
-unsafe impl Send for GStr {}
+// SAFETY: A `GStr` can be transferred across different threads.
+unsafe impl<const SHARED: bool> Send for GStr<SHARED> {}
 
-// SAFETY: A [`GStr`] is immutable, so it's safe to share references between threads.
-unsafe impl Sync for GStr {}
+// SAFETY: A `GStr` is immutable, so it's safe to share references between threads.
+unsafe impl<const SHARED: bool> Sync for GStr<SHARED> {}
 
-impl AsRef<[u8]> for GStr {
+impl<const SHARED: bool> AsRef<[u8]> for GStr<SHARED> {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
 }
 
-impl<T: ?Sized> PartialEq<&'_ T> for GStr
+impl<T: ?Sized, const SHARED: bool> PartialEq<&'_ T> for GStr<SHARED>
 where
     Self: PartialEq<T>,
 {
@@ -1796,63 +2568,63 @@ where
     }
 }
 
-impl PartialEq<str> for GStr {
+impl<const SHARED: bool> PartialEq<str> for GStr<SHARED> {
     #[inline]
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
     }
 }
 
-impl PartialEq<GStr> for str {
+impl<const SHARED: bool> PartialEq<GStr<SHARED>> for str {
     #[inline]
-    fn eq(&self, other: &GStr) -> bool {
+    fn eq(&self, other: &GStr<SHARED>) -> bool {
         self == other.as_str()
     }
 }
 
-impl PartialEq<GStr> for &'_ str {
+impl<const SHARED: bool> PartialEq<GStr<SHARED>> for &'_ str {
     #[inline]
-    fn eq(&self, other: &GStr) -> bool {
+    fn eq(&self, other: &GStr<SHARED>) -> bool {
         *self == other
     }
 }
 
-impl PartialEq<String> for GStr {
+impl<const SHARED: bool> PartialEq<String> for GStr<SHARED> {
     #[inline]
     fn eq(&self, other: &String) -> bool {
         self == other.as_str()
     }
 }
 
-impl PartialEq<GStr> for String {
+impl<const SHARED: bool> PartialEq<GStr<SHARED>> for String {
     #[inline]
-    fn eq(&self, other: &GStr) -> bool {
+    fn eq(&self, other: &GStr<SHARED>) -> bool {
         self.as_str() == other
     }
 }
 
-impl PartialEq<GStr> for &'_ String {
+impl<const SHARED: bool> PartialEq<GStr<SHARED>> for &'_ String {
     #[inline]
-    fn eq(&self, other: &GStr) -> bool {
+    fn eq(&self, other: &GStr<SHARED>) -> bool {
         self.as_str() == other
     }
 }
 
-impl PartialEq<Cow<'_, str>> for GStr {
+impl<const SHARED: bool> PartialEq<Cow<'_, str>> for GStr<SHARED> {
     #[inline]
     fn eq(&self, other: &Cow<'_, str>) -> bool {
         self == other.as_ref()
     }
 }
 
-impl PartialEq<GStr> for Cow<'_, str> {
+impl<const SHARED: bool> PartialEq<GStr<SHARED>> for Cow<'_, str> {
     #[inline]
-    fn eq(&self, other: &GStr) -> bool {
+    fn eq(&self, other: &GStr<SHARED>) -> bool {
         self.as_ref() == other
     }
 }
 
-impl<T: ?Sized> PartialOrd<&'_ T> for GStr
+impl<T: ?Sized, const SHARED: bool> PartialOrd<&'_ T> for GStr<SHARED>
 where
     Self: PartialOrd<T>,
 {
@@ -1862,49 +2634,49 @@ where
     }
 }
 
-impl PartialOrd<str> for GStr {
+impl<const SHARED: bool> PartialOrd<str> for GStr<SHARED> {
     #[inline]
     fn partial_cmp(&self, other: &str) -> Option<Ordering> {
         self.as_str().partial_cmp(other)
     }
 }
 
-impl PartialOrd<GStr> for str {
+impl<const SHARED: bool> PartialOrd<GStr<SHARED>> for str {
     #[inline]
-    fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &GStr<SHARED>) -> Option<Ordering> {
         self.partial_cmp(other.as_str())
     }
 }
 
-impl PartialOrd<GStr> for &'_ str {
+impl<const SHARED: bool> PartialOrd<GStr<SHARED>> for &'_ str {
     #[inline]
-    fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &GStr<SHARED>) -> Option<Ordering> {
         (*self).partial_cmp(other)
     }
 }
 
-impl PartialOrd<String> for GStr {
+impl<const SHARED: bool> PartialOrd<String> for GStr<SHARED> {
     #[inline]
     fn partial_cmp(&self, other: &String) -> Option<Ordering> {
         self.partial_cmp(other.as_str())
     }
 }
 
-impl PartialOrd<GStr> for String {
+impl<const SHARED: bool> PartialOrd<GStr<SHARED>> for String {
     #[inline]
-    fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &GStr<SHARED>) -> Option<Ordering> {
         self.as_str().partial_cmp(other)
     }
 }
 
-impl PartialOrd<GStr> for &'_ String {
+impl<const SHARED: bool> PartialOrd<GStr<SHARED>> for &'_ String {
     #[inline]
-    fn partial_cmp(&self, other: &GStr) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &GStr<SHARED>) -> Option<Ordering> {
         self.as_str().partial_cmp(other)
     }
 }
 
-impl From<char> for GStr {
+impl<const SHARED: bool> From<char> for GStr<SHARED> {
     /// Converts a [`char`] into a [`GStr`].
     ///
     /// # Examples
@@ -1932,14 +2704,14 @@ impl From<char> for GStr {
     }
 }
 
-impl From<&GStr> for GStr {
+impl<const SHARED: bool> From<&GStr<SHARED>> for GStr<SHARED> {
     #[inline]
-    fn from(string: &GStr) -> Self {
+    fn from(string: &GStr<SHARED>) -> Self {
         string.clone()
     }
 }
 
-impl<'a> TryFrom<&'a str> for GStr {
+impl<'a, const SHARED: bool> TryFrom<&'a str> for GStr<SHARED> {
     type Error = ToGStrError<&'a str>;
 
     /// Converts a `&str` into a [`GStr`].
@@ -1951,7 +2723,7 @@ impl<'a> TryFrom<&'a str> for GStr {
     }
 }
 
-impl<'a> TryFrom<&'a mut str> for GStr {
+/* impl<'a, const SHARED: bool> TryFrom<&'a mut str> for GStr<SHARED> {
     type Error = ToGStrError<&'a mut str>;
 
     /// Converts a `&mut str` into a [`GStr`].
@@ -1961,21 +2733,22 @@ impl<'a> TryFrom<&'a mut str> for GStr {
     fn try_from(string: &'a mut str) -> Result<Self, Self::Error> {
         Self::try_new(string)
     }
-}
+} */
 
-impl TryFrom<String> for GStr {
+impl<const SHARED: bool> TryFrom<String> for GStr<SHARED> {
     type Error = ToGStrError<String>;
 
     /// Converts a [`String`] into a [`GStr`].
     ///
-    /// This doesn't clone the string but shrinks it's capacity to match its length.
+    /// If `SHARED` is false, this doesn't clone the string but shrinks it's capacity to match its
+    /// length.
     #[inline]
     fn try_from(string: String) -> Result<Self, Self::Error> {
-        Self::try_from_string(string)
+        Self::gstr_try_from_string(string)
     }
 }
 
-impl<'a> TryFrom<&'a String> for GStr {
+impl<'a, const SHARED: bool> TryFrom<&'a String> for GStr<SHARED> {
     type Error = ToGStrError<&'a String>;
 
     /// Converts a `&String` into a [`GStr`].
@@ -1987,125 +2760,125 @@ impl<'a> TryFrom<&'a String> for GStr {
     }
 }
 
-impl TryFrom<Box<str>> for GStr {
+impl<const SHARED: bool> TryFrom<Box<str>> for GStr<SHARED> {
     type Error = ToGStrError<Box<str>>;
 
     /// Converts a `Box<str>` into a [`GStr`].
     ///
-    /// This doesn't clone the string.
+    /// If `SHARED` is false, this doesn't clone the string.
     #[inline]
     fn try_from(string: Box<str>) -> Result<Self, Self::Error> {
         let string = string.into_string();
 
-        Self::try_from_string(string).map_err_source(String::into_boxed_str)
+        Self::gstr_try_from_string(string).map_err_source(String::into_boxed_str)
     }
 }
 
-impl<'a> TryFrom<Cow<'a, str>> for GStr {
+impl<'a, const SHARED: bool> TryFrom<Cow<'a, str>> for GStr<SHARED> {
     type Error = ToGStrError<Cow<'a, str>>;
 
     /// Converts a `Cow<str>` into a [`GStr`].
     ///
-    /// If the string is owned, this doesn't clone the string but shrinks it's capacity to match its
-    /// length. Otherwise it clones the string.
+    /// If the string is owned and `SHARED` is false, this doesn't clone the string but shrinks it's
+    /// capacity to match its length. Otherwise it clones the string.
     #[inline]
     fn try_from(string: Cow<'a, str>) -> Result<Self, Self::Error> {
         match string {
             Cow::Borrowed(s) => Self::try_new(s).map_err_source(Cow::Borrowed),
-            Cow::Owned(s) => Self::try_from_string(s).map_err_source(Cow::Owned),
+            Cow::Owned(s) => Self::gstr_try_from_string(s).map_err_source(Cow::Owned),
         }
     }
 }
 
-impl<'a> From<&'a GStr> for &'a [u8] {
+impl<'a, const SHARED: bool> From<&'a GStr<SHARED>> for &'a [u8] {
     #[inline]
-    fn from(string: &'a GStr) -> Self {
+    fn from(string: &'a GStr<SHARED>) -> Self {
         string.as_bytes()
     }
 }
 
-impl<'a> From<&'a GStr> for &'a str {
+impl<'a, const SHARED: bool> From<&'a GStr<SHARED>> for &'a str {
     #[inline]
-    fn from(string: &'a GStr) -> Self {
+    fn from(string: &'a GStr<SHARED>) -> Self {
         string.as_str()
     }
 }
 
-impl From<GStr> for String {
+impl<const SHARED: bool> From<GStr<SHARED>> for String {
     #[inline]
-    fn from(string: GStr) -> Self {
-        string.into_string()
+    fn from(string: GStr<SHARED>) -> Self {
+        string.gstr_into_string()
     }
 }
 
-impl From<GStr> for Vec<u8> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Vec<u8> {
     #[inline]
-    fn from(string: GStr) -> Self {
-        string.into_bytes()
+    fn from(string: GStr<SHARED>) -> Self {
+        string.gstr_into_string().into_bytes()
     }
 }
 
-impl From<GStr> for Box<str> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Box<str> {
     #[inline]
-    fn from(string: GStr) -> Self {
-        string.into_boxed_str()
+    fn from(string: GStr<SHARED>) -> Self {
+        string.gstr_into_string().into_boxed_str()
     }
 }
 
-impl From<GStr> for Cow<'_, str> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Cow<'_, str> {
     #[inline]
-    fn from(string: GStr) -> Self {
-        Self::Owned(string.into_string())
+    fn from(string: GStr<SHARED>) -> Self {
+        Self::Owned(string.gstr_into_string())
     }
 }
 
-impl<'a> From<&'a GStr> for Cow<'a, str> {
+impl<'a, const SHARED: bool> From<&'a GStr<SHARED>> for Cow<'a, str> {
     #[inline]
-    fn from(string: &'a GStr) -> Self {
+    fn from(string: &'a GStr<SHARED>) -> Self {
         Self::Borrowed(string.as_str())
     }
 }
 
-impl From<GStr> for Rc<str> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Rc<str> {
     #[inline]
-    fn from(string: GStr) -> Self {
-        Self::from(string.as_ref())
+    fn from(string: GStr<SHARED>) -> Self {
+        Self::from(string.as_str())
     }
 }
 
-impl From<GStr> for Arc<str> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Arc<str> {
     #[inline]
-    fn from(string: GStr) -> Self {
-        Self::from(string.as_ref())
+    fn from(string: GStr<SHARED>) -> Self {
+        Self::from(string.as_str())
     }
 }
 
-impl From<GStr> for Box<dyn Error + Send + Sync + '_> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Box<dyn Error + Send + Sync + '_> {
     #[inline]
-    fn from(string: GStr) -> Self {
-        struct StringError(GStr);
+    fn from(string: GStr<SHARED>) -> Self {
+        struct StringError<const SHARED: bool>(GStr<SHARED>);
 
-        impl fmt::Debug for StringError {
+        impl<const SHARED: bool> fmt::Debug for StringError<SHARED> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 fmt::Debug::fmt(&self.0, f)
             }
         }
 
-        impl fmt::Display for StringError {
+        impl<const SHARED: bool> fmt::Display for StringError<SHARED> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 fmt::Display::fmt(&self.0, f)
             }
         }
 
-        impl Error for StringError {}
+        impl<const SHARED: bool> Error for StringError<SHARED> {}
 
         Box::new(StringError(string))
     }
 }
 
-impl From<GStr> for Box<dyn Error + '_> {
+impl<const SHARED: bool> From<GStr<SHARED>> for Box<dyn Error + '_> {
     #[inline]
-    fn from(string: GStr) -> Self {
+    fn from(string: GStr<SHARED>) -> Self {
         let err1: Box<dyn Error + Send + Sync> = From::from(string);
         let err2: Box<dyn Error> = err1;
 
@@ -2113,17 +2886,63 @@ impl From<GStr> for Box<dyn Error + '_> {
     }
 }
 
-impl<T> FromIterator<T> for GStr
-where
-    String: FromIterator<T>,
-{
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self::from_string(String::from_iter(iter))
+impl<const SHARED: bool> FromIterator<char> for GStr<SHARED> {
+    fn from_iter<T: IntoIterator<Item = char>>(iter: T) -> Self {
+        StringBuffer::<SHARED>::from_iter(iter).into_gstr()
     }
 }
 
-impl FromIterator<GStr> for String {
-    fn from_iter<T: IntoIterator<Item = GStr>>(iter: T) -> Self {
+impl<'a, const SHARED: bool> FromIterator<&'a char> for GStr<SHARED> {
+    fn from_iter<T: IntoIterator<Item = &'a char>>(iter: T) -> Self {
+        Self::from_iter(iter.into_iter().copied())
+    }
+}
+
+fn from_str_iter<I, T, const SHARED: bool>(iter: I) -> GStr<SHARED>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+{
+    let mut buffer = StringBuffer::<SHARED>::new();
+    for item in iter {
+        buffer.push_str(item.as_ref());
+    }
+
+    buffer.into_gstr()
+}
+
+impl<'a, const SHARED: bool> FromIterator<&'a str> for GStr<SHARED> {
+    fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
+        from_str_iter(iter)
+    }
+}
+
+impl<const SHARED: bool> FromIterator<String> for GStr<SHARED> {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        from_str_iter(iter)
+    }
+}
+
+impl<const SHARED: bool> FromIterator<Box<str>> for GStr<SHARED> {
+    fn from_iter<T: IntoIterator<Item = Box<str>>>(iter: T) -> Self {
+        from_str_iter(iter)
+    }
+}
+
+impl<'a, const SHARED: bool> FromIterator<Cow<'a, str>> for GStr<SHARED> {
+    fn from_iter<T: IntoIterator<Item = Cow<'a, str>>>(iter: T) -> Self {
+        from_str_iter(iter)
+    }
+}
+
+impl<const S1: bool, const S2: bool> FromIterator<GStr<S2>> for GStr<S1> {
+    fn from_iter<T: IntoIterator<Item = GStr<S2>>>(iter: T) -> Self {
+        from_str_iter(iter)
+    }
+}
+
+impl<const SHARED: bool> FromIterator<GStr<SHARED>> for String {
+    fn from_iter<T: IntoIterator<Item = GStr<SHARED>>>(iter: T) -> Self {
         let mut string = String::new();
         for s in iter {
             string.push_str(s.as_str());
@@ -2133,15 +2952,15 @@ impl FromIterator<GStr> for String {
     }
 }
 
-impl FromIterator<GStr> for Box<str> {
-    fn from_iter<T: IntoIterator<Item = GStr>>(iter: T) -> Self {
+impl<const SHARED: bool> FromIterator<GStr<SHARED>> for Box<str> {
+    fn from_iter<T: IntoIterator<Item = GStr<SHARED>>>(iter: T) -> Self {
         String::from_iter(iter).into_boxed_str()
     }
 }
 
-impl FromIterator<GStr> for Cow<'_, str> {
-    fn from_iter<T: IntoIterator<Item = GStr>>(iter: T) -> Self {
-        String::from_iter(iter).into()
+impl<const SHARED: bool> FromIterator<GStr<SHARED>> for Cow<'_, str> {
+    fn from_iter<T: IntoIterator<Item = GStr<SHARED>>>(iter: T) -> Self {
+        Cow::Owned(String::from_iter(iter))
     }
 }
 
@@ -2180,75 +2999,59 @@ const fn copy_prefix(bytes: &[u8]) -> [u8; PrefixAndLength::PREFIX_LENGTH] {
 /// The length of `string` must be greater than 0.
 #[inline]
 unsafe fn shrink_and_leak_string(string: String) -> Result<&'static mut str, String> {
-    debug_assert!(!string.is_empty() && string.len() <= GStr::MAX_LENGTH);
+    debug_assert!(!string.is_empty() && string.len() <= GStr::<false>::MAX_LENGTH);
 
     if string.len() == string.capacity() {
         Ok(string.leak())
     } else {
         debug_assert!(string.capacity() > string.len());
 
-        /// Shrinks `string`'s capacity to match its length and leaks it as a static mutable
-        /// [`str`].
-        ///
-        /// If shrinking `string`'s capacity fails, returns the original `string`.
-        ///
-        /// # Safety
-        ///
-        /// Both the length and capacity of `string` must be greater than 0.
-        #[cold]
-        #[inline(never)]
-        unsafe fn realloc_string(string: String) -> Result<&'static mut str, String> {
-            let mut string = ManuallyDrop::new(string);
-            let len = string.len();
-            let capacity = string.capacity();
-            // Not using `string.as_mut_ptr()` to get the raw pointer because it only covers `len`
-            // bytes under the Stacked Borrows rules. Reallocating the memory requires the raw
-            // pointer covers `capacity` bytes.
-            // SAFETY: We just get the raw pointer from `string`'s inner buffer, not mutating its
-            //         content.
-            let ptr = unsafe { string.as_mut_vec().as_mut_ptr() };
-            // SAFETY: The layout of string's inner buffer is valid.
-            let layout = unsafe { Layout::array::<u8>(capacity).unwrap_unchecked() };
-
-            // SAFETY:
-            // - `ptr` is the pointer of `string`'s inner buffer, so it was allocated by the global
-            //   allocator.
-            // - `layout` is the layout of `string`'s inner buffer and its size is greater than 0.
-            // - The length of `string` is guaranteed to be greater than 0.
-            // - `len` doesn't overflows `isize`.
-            let new_ptr = unsafe { alloc::alloc::realloc(ptr, layout, len) };
-
-            if new_ptr.is_null() {
-                Err(ManuallyDrop::into_inner(string))
-            } else {
-                // SAFETY:
-                // - `new_ptr` points to a valid UTF-8 string buffer whose length is `len`.
-                // - `string` is consumed and won't be dropped.
-                unsafe {
-                    Ok(core::str::from_utf8_unchecked_mut(
-                        slice::from_raw_parts_mut(new_ptr, len),
-                    ))
-                }
-            }
-        }
+        let mut string = ManuallyDrop::new(string);
+        let len = string.len();
+        let capacity = string.capacity();
+        // Not using `string.as_mut_ptr()` to get the raw pointer because it only covers `len`
+        // bytes under the Stacked Borrows rules. Reallocating the memory requires the raw
+        // pointer covers `capacity` bytes.
+        // SAFETY: We just get the raw pointer from `string`'s inner buffer, not mutating its
+        //         content.
+        let ptr = unsafe { string.as_mut_vec().as_mut_ptr() };
+        // SAFETY: The layout of string's inner buffer is valid.
+        let layout = unsafe { Layout::array::<u8>(capacity).unwrap_unchecked() };
 
         // SAFETY:
+        // - `ptr` is the pointer of `string`'s inner buffer, so it was allocated by the global
+        //   allocator.
+        // - `layout` is the layout of `string`'s inner buffer and its size is greater than 0.
         // - The length of `string` is guaranteed to be greater than 0.
-        // - The capacity of `string` is greater than its length, so the capacity is greater than 0.
-        unsafe { realloc_string(string) }
+        // - `len` doesn't overflows `isize`.
+        let new_ptr = unsafe { alloc::alloc::realloc(ptr, layout, len) };
+
+        if new_ptr.is_null() {
+            Err(ManuallyDrop::into_inner(string))
+        } else {
+            // SAFETY:
+            // - `new_ptr` points to a valid UTF-8 string buffer whose length is `len`.
+            // - `string` is consumed and won't be dropped.
+            unsafe {
+                Ok(core::str::from_utf8_unchecked_mut(
+                    slice::from_raw_parts_mut(new_ptr, len),
+                ))
+            }
+        }
     }
 }
 
 /// Returns an empty [`GStr`].
 #[cold]
-const fn empty_gstr() -> GStr {
-    GStr::EMPTY
+const fn empty_gstr<const SHARED: bool>() -> GStr<SHARED> {
+    GStr::<SHARED>::EMPTY
 }
 
 /// Returns an allocation failure error.
 #[cold]
-#[inline(never)]
-fn allocation_failure<S: AsRef<str>>(string: S) -> Result<GStr, ToGStrError<S>> {
+fn allocation_failure<S: AsRef<str>, const SHARED: bool>(
+    string: S,
+) -> Result<GStr<SHARED>, ToGStrError<S>> {
     // SAFETY: The layout of `string` is valid.
     let layout = unsafe { Layout::array::<u8>(string.as_ref().len()).unwrap_unchecked() };
 
@@ -2257,16 +3060,17 @@ fn allocation_failure<S: AsRef<str>>(string: S) -> Result<GStr, ToGStrError<S>> 
 
 /// Returns a length overflow error.
 #[cold]
-#[inline(never)]
-fn length_overflow<S>(string: S, len: usize) -> Result<GStr, ToGStrError<S>> {
+fn length_overflow<S, const SHARED: bool>(
+    string: S,
+    len: usize,
+) -> Result<GStr<SHARED>, ToGStrError<S>> {
     Err(ToGStrError::new_length_overflow(string, len))
 }
 
-/// Handle the memory allocation error.
+/// Handles the memory allocation error.
 ///
 /// For more details, see [`handle_alloc_error`](alloc::alloc::handle_alloc_error).
 #[cold]
-#[inline(never)]
 pub(crate) fn handle_alloc_error(layout: Layout) -> ! {
     alloc::alloc::handle_alloc_error(layout)
 }
@@ -2277,21 +3081,36 @@ const _: () = {
 
     #[cfg(target_pointer_width = "64")]
     {
-        assert!(size_of::<GStr>() == 4 * size_of::<u32>());
-        assert!(size_of::<Option<GStr>>() == 4 * size_of::<u32>());
+        assert!(size_of::<GStr<false>>() == 4 * size_of::<u32>());
+        assert!(size_of::<GStr<true>>() == 4 * size_of::<u32>());
+        assert!(size_of::<Option<GStr<false>>>() == 4 * size_of::<u32>());
+        assert!(size_of::<Option<GStr<true>>>() == 4 * size_of::<u32>());
 
         assert!(PrefixAndLength::HALF_BITS == 32);
         assert!(PrefixAndLength::PREFIX_MASK == 0xFFFF_FFFF_0000_0000);
         assert!(PrefixAndLength::LEN_PREFIX_MASK == 0xFFFF_FFFF_7FFF_FFFF);
+
+        assert!(GStr::<true>::_MAX_LENGTH == PrefixAndLength::MAX_LENGTH);
+        assert!(
+            GStr::<true>::_MAX_LENGTH + ATOMIC_SIZE <= isize::MAX as usize - (ATOMIC_ALIGN - 1)
+        );
     }
 
     #[cfg(target_pointer_width = "32")]
     {
-        assert!(size_of::<GStr>() == 3 * size_of::<u32>());
-        assert!(size_of::<Option<GStr>>() == 3 * size_of::<u32>());
+        assert!(size_of::<GStrr<false>>() == 3 * size_of::<u32>());
+        assert!(size_of::<GStr<true>>() == 3 * size_of::<u32>());
+        assert!(size_of::<Option<GStrr<false>>>() == 3 * size_of::<u32>());
+        assert!(size_of::<Option<GStr<true>>>() == 3 * size_of::<u32>());
+
+        assert!(GStr::<true>::_MAX_LENGTH == PrefixAndLength::MAX_LENGTH - 7);
+        assert!(
+            GStr::<true>::_MAX_LENGTH + ATOMIC_SIZE <= isize::MAX as usize - (ATOMIC_ALIGN - 1)
+        );
     }
 
-    assert!(align_of::<GStr>() == align_of::<usize>());
+    assert!(align_of::<GStr<false>>() == align_of::<usize>());
+    assert!(align_of::<GStr<true>>() == align_of::<usize>());
 
     assert!(PrefixAndLength::PREFIX_LENGTH == 4);
     assert!(PrefixAndLength::LENGTH_BITS == 31);
@@ -2299,8 +3118,15 @@ const _: () = {
     assert!(PrefixAndLength::LENGTH_MASK == 0x7FFF_FFFF);
     assert!(PrefixAndLength::MAX_LENGTH == 0x7FFF_FFFF);
 
-    assert!(GStr::MAX_LENGTH == PrefixAndLength::MAX_LENGTH);
-    assert!(GStr::MAX_LENGTH <= isize::MAX as _);
+    assert!(GStr::<false>::_MAX_LENGTH == PrefixAndLength::MAX_LENGTH);
+    assert!(GStr::<false>::_MAX_LENGTH <= isize::MAX as _);
+
+    assert!(GStr::<false>::MAX_LENGTH <= PrefixAndLength::MAX_LENGTH);
+    assert!(GStr::<true>::MAX_LENGTH <= PrefixAndLength::MAX_LENGTH);
+    assert!(GStr::<false>::MAX_LENGTH == GStr::<false>::_MAX_LENGTH);
+    assert!(GStr::<true>::MAX_LENGTH == GStr::<true>::_MAX_LENGTH);
+    assert!(GStr::<false>::MAX_LENGTH == StringBuffer::<false>::MAX_CAPACITY);
+    assert!(GStr::<true>::MAX_LENGTH == StringBuffer::<true>::MAX_CAPACITY);
 };
 
 #[cfg(test)]
@@ -2312,6 +3138,17 @@ mod tests {
     use proptest::prelude::*;
 
     //extern crate std;
+
+    /* fn transmute_gstr<const S1: bool, const S2: bool>(gstr: &GStr<S1>) -> &GStr<S2> {
+        if S1 == S2 {
+            &GStr::<S2> {
+                ptr: gstr.ptr,
+                prefix_and_len: gstr.prefix_and_len,
+            }
+        } else {
+            panic!("")
+        }
+    } */
 
     fn test_literal_strings<F: Fn(&'static str)>(f: F) {
         f("");
@@ -2326,7 +3163,7 @@ mod tests {
         f("hello, 🦀 and 🌎!");
     }
 
-    fn test_gstr_is_eq(a: &GStr, b: &str) {
+    fn test_gstr_is_eq<const SHARED: bool>(a: &GStr<SHARED>, b: &str) {
         assert_eq!(a.len(), b.len());
         assert_eq!(a, b);
         assert_eq!(b, a);
@@ -2335,7 +3172,7 @@ mod tests {
         assert_eq!(a.partial_cmp(b), Some(Ordering::Equal));
         assert_eq!(b.partial_cmp(a), Some(Ordering::Equal));
 
-        let c = GStr::new(b);
+        let c = GStr::<SHARED>::new(b);
         assert_eq!(a.len(), c.len());
         assert_eq!(a, &c);
         assert_eq!(c, a);
@@ -2367,13 +3204,13 @@ mod tests {
         }
     }
 
-    fn test_gstr_concat(gstr: &GStr, string: &str) {
+    fn test_gstr_concat<const SHARED: bool>(gstr: &GStr<SHARED>, string: &str) {
         assert_eq!(gstr.concat(""), gstr);
         assert_eq!(gstr.concat("foo"), format!("{}{}", gstr, "foo"));
         assert_eq!(gstr.concat(string), format!("{}{}", gstr, string));
     }
 
-    fn test_gstr_raw_parts(gstr: GStr, string: &str) {
+    fn test_gstr_raw_parts(gstr: GStr<false>, string: &str) {
         let ptr = gstr.as_ptr();
         let is_static = gstr.is_static();
         let (buf, len) = gstr.into_raw_parts();
@@ -2400,7 +3237,7 @@ mod tests {
         }
     }
 
-    fn test_gstr_into_string(gstr: GStr, string: &str) {
+    fn test_gstr_into_string(gstr: GStr<false>, string: &str) {
         let is_heap = gstr.is_heap();
         let gstr_clone = gstr.clone();
         let ptr = gstr_clone.as_ptr();
@@ -2431,8 +3268,8 @@ mod tests {
         bytes.push(0);
     }
 
-    fn test_gstr_new(string: &str) {
-        let gstr = GStr::new(string);
+    fn test_gstr_new<const SHARED: bool>(string: &str) {
+        let gstr = GStr::<SHARED>::new(string);
 
         if gstr.is_empty() {
             assert!(gstr.is_static());
@@ -2446,12 +3283,14 @@ mod tests {
 
         test_gstr_is_eq(&gstr, string);
         test_gstr_concat(&gstr, string);
-        test_gstr_raw_parts(gstr.clone(), string);
-        test_gstr_into_string(gstr, string);
+        if !SHARED {
+            test_gstr_raw_parts(gstr.clone().transmute_to::<false>(), string);
+            test_gstr_into_string(gstr.transmute_to::<false>(), string);
+        }
     }
 
-    fn test_gstr_from_static(string: &'static str) {
-        let gstr = GStr::from_static(string);
+    fn test_gstr_from_static<const SHARED: bool>(string: &'static str) {
+        let gstr = GStr::<SHARED>::from_static(string);
 
         assert!(gstr.is_static());
         assert!(!gstr.is_heap());
@@ -2459,8 +3298,10 @@ mod tests {
 
         test_gstr_is_eq(&gstr, string);
         test_gstr_concat(&gstr, string);
-        test_gstr_raw_parts(gstr.clone(), string);
-        test_gstr_into_string(gstr, string);
+        if !SHARED {
+            test_gstr_raw_parts(gstr.clone().transmute_to::<false>(), string);
+            test_gstr_into_string(gstr.transmute_to::<false>(), string);
+        }
     }
 
     fn test_gstr_from_string(string: &str) {
@@ -2501,16 +3342,18 @@ mod tests {
         test_gstr_into_string(gstr, string);
     }
 
-    fn test_gstr_eq_cmp(a: &str, b: &str) {
-        let gstr_a = GStr::new(a);
-        let gstr_b = GStr::new(b);
+    fn test_gstr_eq_cmp<const S1: bool, const S2: bool>(a: &str, b: &str) {
+        let gstr_a = GStr::<S1>::new(a);
+        let gstr_b = GStr::<S2>::new(b);
 
         assert_eq!(gstr_a > gstr_b, a > b);
         assert_eq!(gstr_a < gstr_b, a < b);
         assert_eq!(gstr_a == gstr_b, a == b);
         assert_eq!(gstr_a >= gstr_b, a >= b);
         assert_eq!(gstr_a <= gstr_b, a <= b);
-        assert_eq!(gstr_a.cmp(&gstr_b), a.cmp(b));
+        if S1 == S2 {
+            assert_eq!(gstr_a.cmp(&gstr_b.clone().transmute_to::<S1>()), a.cmp(b));
+        }
         assert_eq!(gstr_a.partial_cmp(&gstr_b), a.partial_cmp(b));
 
         assert_eq!(gstr_b > gstr_a, b > a);
@@ -2518,7 +3361,9 @@ mod tests {
         assert_eq!(gstr_b == gstr_a, b == a);
         assert_eq!(gstr_b >= gstr_a, b >= a);
         assert_eq!(gstr_b <= gstr_a, b <= a);
-        assert_eq!(gstr_b.cmp(&gstr_a), b.cmp(a));
+        if S1 == S2 {
+            assert_eq!(gstr_b.cmp(&gstr_a.clone().transmute_to::<S2>()), b.cmp(a));
+        }
         assert_eq!(gstr_b.partial_cmp(&gstr_a), b.partial_cmp(a));
 
         assert_eq!(gstr_a > b, a > gstr_b);
@@ -2556,28 +3401,34 @@ mod tests {
         }
     }
 
+    fn gstr_eq_cmp_all(a: &str, b: &str) {
+        test_gstr_eq_cmp::<false, false>(a, b);
+        test_gstr_eq_cmp::<false, true>(a, b);
+        test_gstr_eq_cmp::<true, true>(a, b);
+    }
+
     #[cfg(any(not(miri), feature = "proptest_miri"))]
-    fn test_gstr_valid_utf8(string: String) {
-        let gstr = GStr::from_utf8(string.clone().into_bytes()).unwrap();
+    fn test_gstr_valid_utf8<const SHARED: bool>(string: String) {
+        let gstr = GStr::<SHARED>::from_utf8(string.clone().into_bytes()).unwrap();
         assert_eq!(gstr, string);
 
-        let gstr = GStr::from_utf8_lossy(string.clone().into_bytes());
+        let gstr = GStr::<SHARED>::from_utf8_lossy(string.clone().into_bytes());
         assert_eq!(gstr, string);
 
         // SAFETY: `string` is valid UTF-8.
-        let gstr = unsafe { GStr::from_utf8_unchecked(string.clone().into_bytes()) };
+        let gstr = unsafe { GStr::<SHARED>::from_utf8_unchecked(string.clone().into_bytes()) };
         assert_eq!(gstr, string);
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
-    fn test_gstr_utf8_bytes(bytes: Vec<u8>) {
-        let gstr = GStr::from_utf8(bytes.clone());
+    fn test_gstr_utf8_bytes<const SHARED: bool>(bytes: Vec<u8>) {
+        let gstr = GStr::<SHARED>::from_utf8(bytes.clone());
         let string = String::from_utf8(bytes.clone());
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
 
             // SAFETY: `bytes` is valid UTF-8.
-            let gstr = unsafe { GStr::from_utf8_unchecked(bytes.clone()) };
+            let gstr = unsafe { GStr::<SHARED>::from_utf8_unchecked(bytes.clone()) };
             assert_eq!(gstr, string);
         } else {
             let err = gstr.unwrap_err();
@@ -2585,42 +3436,42 @@ mod tests {
             assert_eq!(err.into_source(), bytes);
         }
 
-        let gstr = GStr::from_utf8_lossy(bytes.clone());
+        let gstr = GStr::<SHARED>::from_utf8_lossy(bytes.clone());
         let string = String::from_utf8_lossy(&bytes);
         assert_eq!(gstr, string);
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
-    fn test_gstr_valid_utf16(string: String) {
+    fn test_gstr_valid_utf16<const SHARED: bool>(string: String) {
         let bytes = string.encode_utf16().collect::<Vec<_>>();
-        let gstr = GStr::from_utf16(&bytes).unwrap();
+        let gstr = GStr::<SHARED>::from_utf16(&bytes).unwrap();
         assert_eq!(gstr, string);
 
-        let gstr = GStr::from_utf16_lossy(&bytes);
+        let gstr = GStr::<SHARED>::from_utf16_lossy(&bytes);
         assert_eq!(gstr, string);
 
         let utf16_le = bytes
             .iter()
             .flat_map(|n| n.to_le_bytes())
             .collect::<Vec<_>>();
-        let gstr = GStr::from_utf16le(&utf16_le).unwrap();
+        let gstr = GStr::<SHARED>::from_utf16le(&utf16_le).unwrap();
         assert_eq!(gstr, string);
-        let gstr = GStr::from_utf16le_lossy(&utf16_le);
+        let gstr = GStr::<SHARED>::from_utf16le_lossy(&utf16_le);
         assert_eq!(gstr, string);
 
         let utf16_be = bytes
             .iter()
             .flat_map(|n| n.to_be_bytes())
             .collect::<Vec<_>>();
-        let gstr = GStr::from_utf16be(&utf16_be).unwrap();
+        let gstr = GStr::<SHARED>::from_utf16be(&utf16_be).unwrap();
         assert_eq!(gstr, string);
-        let gstr = GStr::from_utf16be_lossy(&utf16_be);
+        let gstr = GStr::<SHARED>::from_utf16be_lossy(&utf16_be);
         assert_eq!(gstr, string);
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
-    fn test_gstr_utf16_u16_bytes(bytes: Vec<u16>) {
-        let gstr = GStr::from_utf16(&bytes);
+    fn test_gstr_utf16_u16_bytes<const SHARED: bool>(bytes: Vec<u16>) {
+        let gstr = GStr::<SHARED>::from_utf16(&bytes);
         let string = String::from_utf16(&bytes);
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
@@ -2630,15 +3481,15 @@ mod tests {
             assert_eq!(err.into_source(), &bytes);
         }
 
-        let gstr = GStr::from_utf16_lossy(&bytes);
+        let gstr = GStr::<SHARED>::from_utf16_lossy(&bytes);
         let string = String::from_utf16_lossy(&bytes);
         assert_eq!(gstr, string);
     }
 
     #[cfg(feature = "nightly_test")]
-    fn test_gstr_utf16_u8_bytes(bytes: Vec<u8>) {
+    fn test_gstr_utf16_u8_bytes<const SHARED: bool>(bytes: Vec<u8>) {
         let string = String::from_utf16le(&bytes);
-        let gstr = GStr::from_utf16le(&bytes);
+        let gstr = GStr::<SHARED>::from_utf16le(&bytes);
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
         } else {
@@ -2651,11 +3502,11 @@ mod tests {
         }
 
         let string = String::from_utf16le_lossy(&bytes);
-        let gstr = GStr::from_utf16le_lossy(&bytes);
+        let gstr = GStr::<SHARED>::from_utf16le_lossy(&bytes);
         assert_eq!(string, gstr);
 
         let string = String::from_utf16be(&bytes);
-        let gstr = GStr::from_utf16be(&bytes);
+        let gstr = GStr::<SHARED>::from_utf16be(&bytes);
         if let Ok(string) = string {
             assert_eq!(string, gstr.unwrap());
         } else {
@@ -2668,18 +3519,20 @@ mod tests {
         }
 
         let string = String::from_utf16be_lossy(&bytes);
-        let gstr = GStr::from_utf16be_lossy(&bytes);
+        let gstr = GStr::<SHARED>::from_utf16be_lossy(&bytes);
         assert_eq!(string, gstr);
     }
 
     #[test]
     fn gstr_new() {
-        test_literal_strings(test_gstr_new);
+        test_literal_strings(test_gstr_new::<false>);
+        test_literal_strings(test_gstr_new::<true>);
     }
 
     #[test]
     fn gstr_from_static() {
-        test_literal_strings(test_gstr_from_static);
+        test_literal_strings(test_gstr_from_static::<false>);
+        test_literal_strings(test_gstr_from_static::<true>);
     }
 
     #[test]
@@ -2689,20 +3542,20 @@ mod tests {
 
     #[test]
     fn gstr_eq_cmp() {
-        test_gstr_eq_cmp("", "");
-        test_gstr_eq_cmp("", "a");
-        test_gstr_eq_cmp("", "abcdefghijklm");
-        test_gstr_eq_cmp("ab", "ab");
-        test_gstr_eq_cmp("ab", "ac");
-        test_gstr_eq_cmp("ab", "bd");
-        test_gstr_eq_cmp("ab", "abc");
-        test_gstr_eq_cmp("ab", "abcdefghijklm");
-        test_gstr_eq_cmp("ab", "hello, 🦀 and 🌎!");
-        test_gstr_eq_cmp("abcdefghijklm", "abcdefghijklm");
-        test_gstr_eq_cmp("abcdefghijklm", "abcdefghijkln");
-        test_gstr_eq_cmp("abcdefghijklm", "nopqrstuvwxyz");
-        test_gstr_eq_cmp("abcdefghijklm", "abcdefghijklmn");
-        test_gstr_eq_cmp("abcdefghijklm", "hello, 🦀 and 🌎!");
+        gstr_eq_cmp_all("", "");
+        gstr_eq_cmp_all("", "a");
+        gstr_eq_cmp_all("", "abcdefghijklm");
+        gstr_eq_cmp_all("ab", "ab");
+        gstr_eq_cmp_all("ab", "ac");
+        gstr_eq_cmp_all("ab", "bd");
+        gstr_eq_cmp_all("ab", "abc");
+        gstr_eq_cmp_all("ab", "abcdefghijklm");
+        gstr_eq_cmp_all("ab", "hello, 🦀 and 🌎!");
+        gstr_eq_cmp_all("abcdefghijklm", "abcdefghijklm");
+        gstr_eq_cmp_all("abcdefghijklm", "abcdefghijkln");
+        gstr_eq_cmp_all("abcdefghijklm", "nopqrstuvwxyz");
+        gstr_eq_cmp_all("abcdefghijklm", "abcdefghijklmn");
+        gstr_eq_cmp_all("abcdefghijklm", "hello, 🦀 and 🌎!");
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
@@ -2725,7 +3578,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_new(string: String) {
-            test_gstr_new(&string);
+            test_gstr_new::<false>(&string);
+            test_gstr_new::<true>(&string);
         }
     }
 
@@ -2733,7 +3587,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_from_static(string: String) {
-            string_to_static(string, test_gstr_from_static);
+            string_to_static(string.clone(), test_gstr_from_static::<false>);
+            string_to_static(string, test_gstr_from_static::<true>);
         }
     }
 
@@ -2749,7 +3604,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_eq_cmp(a: String, b: String) {
-            test_gstr_eq_cmp(&a, &b);
+            gstr_eq_cmp_all(&a, &b);
         }
     }
 
@@ -2757,7 +3612,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_valid_utf8(string: String) {
-            test_gstr_valid_utf8(string);
+            test_gstr_valid_utf8::<false>(string.clone());
+            test_gstr_valid_utf8::<true>(string);
         }
     }
 
@@ -2765,7 +3621,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_utf8_bytes(bytes: Vec<u8>) {
-            test_gstr_utf8_bytes(bytes);
+            test_gstr_utf8_bytes::<false>(bytes.clone());
+            test_gstr_utf8_bytes::<true>(bytes);
         }
     }
 
@@ -2773,7 +3630,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_valid_utf16(string: String) {
-            test_gstr_valid_utf16(string);
+            test_gstr_valid_utf16::<false>(string.clone());
+            test_gstr_valid_utf16::<true>(string);
         }
     }
 
@@ -2781,7 +3639,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_utf16_u16_bytes(bytes: Vec<u16>) {
-            test_gstr_utf16_u16_bytes(bytes);
+            test_gstr_utf16_u16_bytes::<false>(bytes.clone());
+            test_gstr_utf16_u16_bytes::<true>(bytes);
         }
     }
 
@@ -2789,7 +3648,8 @@ mod tests {
     proptest! {
         #[test]
         fn prop_gstr_utf16_u8_bytes(bytes: Vec<u8>) {
-            test_gstr_utf16_u8_bytes(bytes);
+            test_gstr_utf16_u8_bytes::<false>(bytes.clone());
+            test_gstr_utf16_u8_bytes::<true>(bytes);
         }
     }
 }

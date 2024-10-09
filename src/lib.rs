@@ -6,8 +6,7 @@
 #[cfg(target_pointer_width = "16")]
 compile_error!("16-bit platforms aren't supported");
 
-mod gstr;
-pub use gstr::*;
+pub mod gstr;
 
 #[cfg(feature = "serde")]
 mod serde;
@@ -17,3 +16,7 @@ mod rkyv;
 
 #[cfg(feature = "std")]
 mod std_impl;
+
+pub type GStr = gstr::GStr<false>;
+
+pub type SharedGStr = gstr::GStr<true>;

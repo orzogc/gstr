@@ -10,9 +10,9 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-use crate::{ErrorKind, GStr};
+use crate::gstr::{handle_alloc_error, ErrorKind, GStr};
 
-impl Serialize for GStr {
+impl<const SHARED: bool> Serialize for GStr<SHARED> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -21,20 +21,20 @@ impl Serialize for GStr {
     }
 }
 
-impl<'de> Deserialize<'de> for GStr {
+impl<'de, const SHARED: bool> Deserialize<'de> for GStr<SHARED> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_string(GStrVisitor)
+        deserializer.deserialize_string(GStrVisitor::<SHARED>)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GStrVisitor;
+struct GStrVisitor<const SHARED: bool>;
 
-impl<'de> Visitor<'de> for GStrVisitor {
-    type Value = GStr;
+impl<'de, const SHARED: bool> Visitor<'de> for GStrVisitor<SHARED> {
+    type Value = GStr<SHARED>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         formatter.write_str("a string")
@@ -48,7 +48,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
             Ok(s) => Ok(s),
             Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
-                ErrorKind::AllocationFailure(layout) => crate::handle_alloc_error(layout),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                 // SAFETY: `GStr::try_new` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
@@ -59,12 +59,12 @@ impl<'de> Visitor<'de> for GStrVisitor {
     where
         E: Error,
     {
-        match GStr::try_from_string(v) {
+        match GStr::gstr_try_from_string(v) {
             Ok(s) => Ok(s),
             Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
-                ErrorKind::AllocationFailure(layout) => crate::handle_alloc_error(layout),
-                // SAFETY: `GStr::try_from_string` doesn't return other errors.
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
+                // SAFETY: `GStr::gstr_try_from_string` doesn't return other errors.
                 _ => unsafe { core::hint::unreachable_unchecked() },
             },
         }
@@ -74,7 +74,7 @@ impl<'de> Visitor<'de> for GStrVisitor {
     where
         E: Error,
     {
-        if v.len() > GStr::MAX_LENGTH {
+        if v.len() > GStr::<SHARED>::MAX_LENGTH {
             length_overflow(v.len())
         } else {
             match core::str::from_utf8(v) {
@@ -88,11 +88,11 @@ impl<'de> Visitor<'de> for GStrVisitor {
     where
         E: Error,
     {
-        match GStr::from_utf8(v) {
+        match GStr::<SHARED>::from_utf8(v) {
             Ok(s) => Ok(s),
             Err(e) => match e.error_kind() {
                 ErrorKind::LengthOverflow(len) => length_overflow(len),
-                ErrorKind::AllocationFailure(layout) => crate::handle_alloc_error(layout),
+                ErrorKind::AllocationFailure(layout) => handle_alloc_error(layout),
                 ErrorKind::Utf8Error(_) => {
                     Err(Error::invalid_value(Unexpected::Bytes(e.source()), &self))
                 }
@@ -105,10 +105,10 @@ impl<'de> Visitor<'de> for GStrVisitor {
 
 #[cold]
 #[inline(never)]
-fn length_overflow<E: Error>(len: usize) -> Result<GStr, E> {
+fn length_overflow<E: Error, const SHARED: bool>(len: usize) -> Result<GStr<SHARED>, E> {
     Err(E::custom(format!(
         "the length of string/bytes should be less than or equal to {}: {}",
-        GStr::MAX_LENGTH,
+        GStr::<SHARED>::MAX_LENGTH,
         len
     )))
 }
@@ -126,13 +126,13 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-    struct GStrStruct {
-        a: GStr,
+    struct GStrStruct<const SHARED: bool> {
+        a: GStr<SHARED>,
     }
 
-    fn test_gstr_serde(string: String) {
+    fn test_gstr_serde<const SHARED: bool>(string: String) {
         let str_json = serde_json::to_string(string.as_str()).unwrap();
-        let gstr: GStr = serde_json::from_str(&str_json).unwrap();
+        let gstr: GStr<SHARED> = serde_json::from_str(&str_json).unwrap();
         assert_eq!(gstr, string);
 
         let string_struct = StringStruct { a: string };
@@ -143,23 +143,27 @@ mod tests {
         assert_eq!(string_json, gstr_json);
 
         let string_de: StringStruct = serde_json::from_str(&string_json).unwrap();
-        let gstr_de: GStrStruct = serde_json::from_str(&gstr_json).unwrap();
+        let gstr_de: GStrStruct<SHARED> = serde_json::from_str(&gstr_json).unwrap();
         assert_eq!(string_de, string_struct);
         assert_eq!(gstr_de, gstr_struct);
     }
 
     #[test]
     fn gstr_serde() {
-        test_gstr_serde("".into());
-        test_gstr_serde("foo".into());
-        test_gstr_serde("hello, 🦀 and 🌎!".into());
+        test_gstr_serde::<false>("".into());
+        test_gstr_serde::<true>("".into());
+        test_gstr_serde::<false>("foo".into());
+        test_gstr_serde::<true>("foo".into());
+        test_gstr_serde::<false>("hello, 🦀 and 🌎!".into());
+        test_gstr_serde::<true>("hello, 🦀 and 🌎!".into());
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
     proptest! {
         #[test]
         fn prop_gstr_serde(string: String) {
-            test_gstr_serde(string);
+            test_gstr_serde::<false>(string.clone());
+            test_gstr_serde::<true>(string);
         }
     }
 }
