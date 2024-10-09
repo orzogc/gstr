@@ -17,6 +17,11 @@ mod rkyv;
 #[cfg(feature = "std")]
 mod std_impl;
 
+/// An immutable string implementation optimized for small strings and comparison.
 pub type GStr = gstr::GStr<false>;
 
+/// An immutable string implementation optimized for small strings and comparison.
+///
+/// [`SharedGStr`] uses the atomic reference internally, so cloning a [`SharedGStr`] only takes
+/// `O(1)` time.
 pub type SharedGStr = gstr::GStr<true>;

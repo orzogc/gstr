@@ -1,3 +1,5 @@
+//! An immutable string implementation optimized for small strings and comparison.
+
 use core::{
     borrow::Borrow,
     cmp::Ordering,
@@ -3098,9 +3100,9 @@ const _: () = {
 
     #[cfg(target_pointer_width = "32")]
     {
-        assert!(size_of::<GStrr<false>>() == 3 * size_of::<u32>());
+        assert!(size_of::<GStr<false>>() == 3 * size_of::<u32>());
         assert!(size_of::<GStr<true>>() == 3 * size_of::<u32>());
-        assert!(size_of::<Option<GStrr<false>>>() == 3 * size_of::<u32>());
+        assert!(size_of::<Option<GStr<false>>>() == 3 * size_of::<u32>());
         assert!(size_of::<Option<GStr<true>>>() == 3 * size_of::<u32>());
 
         assert!(GStr::<true>::_MAX_LENGTH == PrefixAndLength::MAX_LENGTH - 7);

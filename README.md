@@ -1,5 +1,7 @@
 # gstr
 
+## GStr
+
 `GStr` is an immutable string implementation optimized for small strings and comparison.
 
 The size of `GStr` or `Option<GStr>` is guaranteed to be 16 bytes on 64-bit platforms or 12 bytes on 32-bit platforms.
@@ -7,6 +9,12 @@ The size of `GStr` or `Option<GStr>` is guaranteed to be 16 bytes on 64-bit plat
 The first 4 bytes of the string buffer are inlined in `GStr`, so comparing two `GStr`s is faster than comparing two [`str`](https://doc.rust-lang.org/core/primitive.str.html)s in most cases.
 
 The maximum length of `GStr` is [`i32::MAX`](https://doc.rust-lang.org/core/primitive.i32.html#associatedconstant.MAX).
+
+## SharedGStr
+
+`SharedGStr` is similar to `GStr`, but using the atomic reference counting internally, so cloning a `SharedGStr` only takes `O(1)` time.
+
+The maximum length of `SharedGStr` is [`i32::MAX`](https://doc.rust-lang.org/core/primitive.i32.html#associatedconstant.MAX) on 64-bit platforms or `i32::MAX - 7` on 32-bit platforms.
 
 ## Usage
 
@@ -38,4 +46,4 @@ assert_eq!(gstr, "Hello, 🦀 and 🌎!");
 
 ## Warnings
 
-`gstr` is not tested on big endian platforms, but it maybe works fine on them.
+`gstr` is not tested on big-endian platforms, but it maybe works fine on them.
