@@ -1101,7 +1101,8 @@ impl<const SHARED: bool> GStr<SHARED> {
         }
     }
 
-    /// Creates a [`GStr`] from a static string. It can be used in const context.
+    /// Creates a [`GStr`] from a static string without any allocation. It can be used in const
+    /// context.
     ///
     /// If the string buffer is allocated from the heap memory, when the returned [`GStr`] is
     /// dropped, the string buffer's memory will be leaked.
@@ -2434,18 +2435,27 @@ impl<const SHARED: bool> Clone for GStr<SHARED> {
                 // We have accessed this `GStr`, its refernece count is greater than zero, so its
                 // memory can't be deallocated, using `Ordering::Relaxed` is safe here.
                 if self.ref_count().fetch_add(1, atomic::Ordering::Relaxed) > isize::MAX as usize {
+                    /// Aborts the program.
+                    ///
+                    /// An `extern "C"` function doesn't support unwinding. This makes sure the
+                    /// program is aborted in no-std environments.
+                    #[cold]
+                    extern "C" fn nounwind_abort() -> ! {
+                        #[cfg(feature = "std")]
+                        {
+                            extern crate std;
+
+                            std::process::abort();
+                        }
+
+                        #[cfg(not(feature = "std"))]
+                        {
+                            panic!("the reference count of `GStr` is greater than `isize::MAX`");
+                        }
+                    }
+
                     // If the reference count is greater than `isize::MAX`, aborts the program.
-                    #[cfg(feature = "std")]
-                    {
-                        extern crate std;
-
-                        std::process::abort();
-                    }
-
-                    #[cfg(not(feature = "std"))]
-                    {
-                        panic!("the reference count of `GStr` is greater than `isize::MAX`");
-                    }
+                    nounwind_abort();
                 }
 
                 Self {
@@ -2900,6 +2910,7 @@ impl<'a, const SHARED: bool> FromIterator<&'a char> for GStr<SHARED> {
     }
 }
 
+/// Creates a [`GStr`] from an iterator of strings.
 fn from_str_iter<I, T, const SHARED: bool>(iter: I) -> GStr<SHARED>
 where
     I: IntoIterator<Item = T>,
@@ -2914,6 +2925,19 @@ where
 }
 
 impl<'a, const SHARED: bool> FromIterator<&'a str> for GStr<SHARED> {
+    /// Creates a [`GStr`] from an iterator of `&str`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gstr::{GStr, SharedGStr};
+    ///
+    /// let gstr = GStr::from_iter(["hello,", " 🦀 ", "and 🌎!"]);
+    /// assert_eq!(gstr, "hello, 🦀 and 🌎!");
+    ///
+    /// let gstr: SharedGStr = ["hello,", " 🦀 ", "and 🌎!"].into_iter().collect();
+    /// assert_eq!(gstr, "hello, 🦀 and 🌎!");
+    /// ```
     fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
         from_str_iter(iter)
     }
@@ -3140,17 +3164,6 @@ mod tests {
     use proptest::prelude::*;
 
     //extern crate std;
-
-    /* fn transmute_gstr<const S1: bool, const S2: bool>(gstr: &GStr<S1>) -> &GStr<S2> {
-        if S1 == S2 {
-            &GStr::<S2> {
-                ptr: gstr.ptr,
-                prefix_and_len: gstr.prefix_and_len,
-            }
-        } else {
-            panic!("")
-        }
-    } */
 
     fn test_literal_strings<F: Fn(&'static str)>(f: F) {
         f("");
@@ -3488,7 +3501,7 @@ mod tests {
         assert_eq!(gstr, string);
     }
 
-    #[cfg(feature = "nightly_test")]
+    #[cfg(any(all(not(miri), feature = "nightly_test"), feature = "proptest_miri"))]
     fn test_gstr_utf16_u8_bytes<const SHARED: bool>(bytes: Vec<u8>) {
         let string = String::from_utf16le(&bytes);
         let gstr = GStr::<SHARED>::from_utf16le(&bytes);
@@ -3525,6 +3538,13 @@ mod tests {
         assert_eq!(string, gstr);
     }
 
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    fn test_gstr_from_iter<const SHARED: bool>(strings: Vec<String>) {
+        let string = String::from_iter(strings.clone());
+        let gstr = GStr::<SHARED>::from_iter(strings);
+        assert_eq!(string, gstr);
+    }
+
     #[test]
     fn gstr_new() {
         test_literal_strings(test_gstr_new::<false>);
@@ -3558,6 +3578,38 @@ mod tests {
         gstr_eq_cmp_all("abcdefghijklm", "nopqrstuvwxyz");
         gstr_eq_cmp_all("abcdefghijklm", "abcdefghijklmn");
         gstr_eq_cmp_all("abcdefghijklm", "hello, 🦀 and 🌎!");
+    }
+
+    #[test]
+    fn shared_gstr_clone() {
+        extern crate std;
+
+        fn clone_gstr(gstr: &GStr<true>) {
+            const NUM: usize = 128;
+
+            for _ in 0..NUM {
+                let _ = core::hint::black_box(gstr.clone());
+            }
+        }
+
+        let a = GStr::<true>::new("hello, 🦀 and 🌎!");
+        assert_eq!(a.ref_count().load(atomic::Ordering::Relaxed), 1);
+        let b = a.clone();
+        assert_eq!(a.ref_count().load(atomic::Ordering::Relaxed), 2);
+        let c = a.clone();
+        assert_eq!(a.ref_count().load(atomic::Ordering::Relaxed), 3);
+
+        let handler1 = std::thread::spawn(move || {
+            clone_gstr(&b);
+        });
+        let handler2 = std::thread::spawn(move || {
+            clone_gstr(&c);
+        });
+        clone_gstr(&a);
+
+        handler1.join().unwrap();
+        handler2.join().unwrap();
+        assert_eq!(a.ref_count().load(atomic::Ordering::Relaxed), 1);
     }
 
     #[cfg(any(not(miri), feature = "proptest_miri"))]
@@ -3646,12 +3698,21 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "nightly_test")]
+    #[cfg(any(all(not(miri), feature = "nightly_test"), feature = "proptest_miri"))]
     proptest! {
         #[test]
         fn prop_gstr_utf16_u8_bytes(bytes: Vec<u8>) {
             test_gstr_utf16_u8_bytes::<false>(bytes.clone());
             test_gstr_utf16_u8_bytes::<true>(bytes);
+        }
+    }
+
+    #[cfg(any(not(miri), feature = "proptest_miri"))]
+    proptest! {
+        #[test]
+        fn prop_gstr_from_iter(strings: Vec<String>) {
+            test_gstr_from_iter::<false>(strings.clone());
+            test_gstr_from_iter::<true>(strings);
         }
     }
 }
